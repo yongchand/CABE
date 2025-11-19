@@ -1,0 +1,4 @@
+"""
+Drug Discovery MoNIG Package
+"""
+
