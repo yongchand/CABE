@@ -35,6 +35,21 @@ def analyze_uncertainty(csv_path):
     """
     df = pd.read_csv(csv_path)
     
+    # Map column names from inference output to expected names
+    # Inference outputs: y_pred, y_true, std, epistemic, aleatoric (and Expert columns for MoNIG)
+    # Analyze expects: MoNIG_Prediction, True_Affinity, MoNIG_Std, MoNIG_Epistemic, MoNIG_Aleatoric
+    
+    if 'y_pred' in df.columns:
+        # New format from inference script - map basic columns
+        df['MoNIG_Prediction'] = df['y_pred']
+        df['True_Affinity'] = df['y_true']
+        df['MoNIG_Std'] = df['std']
+        df['MoNIG_Epistemic'] = df['epistemic']
+        df['MoNIG_Aleatoric'] = df['aleatoric']
+        # Expert columns should already be present if model_type == "MoNIG"
+    elif 'MoNIG_Prediction' not in df.columns:
+        raise ValueError("CSV must contain either 'y_pred'/'y_true' columns (inference format) or 'MoNIG_Prediction'/'True_Affinity' columns (legacy format)")
+    
     # Calculate prediction errors
     df['MoNIG_Error'] = np.abs(df['MoNIG_Prediction'] - df['True_Affinity'])
     
@@ -53,7 +68,9 @@ def analyze_uncertainty(csv_path):
     df['MoNIG_Total_Uncertainty'] = df['MoNIG_Epistemic'] + df['MoNIG_Aleatoric']
     
     # Predicted std (square root of total uncertainty for uncertainty_toolbox)
-    df['MoNIG_Std'] = np.sqrt(df['MoNIG_Total_Uncertainty'])
+    # Already set above, but ensure it's correct
+    if 'MoNIG_Std' not in df.columns or df['MoNIG_Std'].isna().any():
+        df['MoNIG_Std'] = np.sqrt(df['MoNIG_Total_Uncertainty'])
     
     print("="*80)
     print("UNCERTAINTY ANALYSIS REPORT (using uncertainty_toolbox)")
@@ -386,100 +403,142 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
     
     # Per-Expert Epistemic Uncertainty
     ax4 = plt.subplot(3, 4, 4)
-    expert_epistemic_data = [df[f'Expert{j+1}_Epistemic'].values for j in range(num_experts)]
-    expert_epistemic_data.append(df['MoNIG_Epistemic'].values)
-    positions = list(range(1, num_experts + 2))
-    expert_labels = [f'Expert {j+1}' for j in range(num_experts)] + ['MoNIG']
-    _ = ax4.boxplot(expert_epistemic_data, 
-                     positions=positions, widths=0.6, patch_artist=True,
-                     boxprops=dict(facecolor='lightblue', alpha=0.7))
-    ax4.set_xticklabels(expert_labels)
+    if num_experts > 0:
+        expert_epistemic_data = [df[f'Expert{j+1}_Epistemic'].values for j in range(num_experts)]
+        expert_epistemic_data.append(df['MoNIG_Epistemic'].values)
+        positions = list(range(1, num_experts + 2))
+        expert_labels = [f'Expert {j+1}' for j in range(num_experts)] + ['MoNIG']
+        _ = ax4.boxplot(expert_epistemic_data, 
+                         positions=positions, widths=0.6, patch_artist=True,
+                         boxprops=dict(facecolor='lightblue', alpha=0.7))
+        ax4.set_xticklabels(expert_labels)
+    else:
+        # Just show MoNIG if no experts
+        _ = ax4.boxplot([df['MoNIG_Epistemic'].values], 
+                         positions=[1], widths=0.6, patch_artist=True,
+                         boxprops=dict(facecolor='lightblue', alpha=0.7))
+        ax4.set_xticklabels(['MoNIG'])
     ax4.set_ylabel('Epistemic Uncertainty')
     ax4.set_title('Epistemic Uncertainty Comparison')
     ax4.grid(axis='y', alpha=0.3)
     
-    # Row 2: Expert Analysis
+    # Row 2: Expert Analysis (only if experts are present)
     # Expert Confidence Distribution
     ax5 = plt.subplot(3, 4, 5)
     colors = ['coral', 'skyblue', 'lightgreen', 'orange', 'purple']
-    for j in range(num_experts):
-        expert_num = j + 1
-        ax5.hist(df[f'Expert{expert_num}_Confidence_nu'], bins=50, alpha=0.6, 
-                label=f'Expert {expert_num}', density=True, color=colors[j % len(colors)])
-    ax5.set_xlabel('Confidence (ν)')
-    ax5.set_ylabel('Density')
-    ax5.set_title('Expert Confidence Distribution')
-    ax5.legend()
-    ax5.set_yscale('log')
+    if num_experts > 0:
+        for j in range(num_experts):
+            expert_num = j + 1
+            if f'Expert{expert_num}_Confidence_nu' in df.columns:
+                ax5.hist(df[f'Expert{expert_num}_Confidence_nu'], bins=50, alpha=0.6, 
+                        label=f'Expert {expert_num}', density=True, color=colors[j % len(colors)])
+        ax5.set_xlabel('Confidence (ν)')
+        ax5.set_ylabel('Density')
+        ax5.set_title('Expert Confidence Distribution')
+        ax5.legend()
+        ax5.set_yscale('log')
+    else:
+        ax5.text(0.5, 0.5, 'No expert data available', 
+                ha='center', va='center', transform=ax5.transAxes)
+        ax5.set_title('Expert Confidence Distribution (N/A)')
     
     # Expert Weights Distribution
     ax6 = plt.subplot(3, 4, 6)
-    for j in range(num_experts):
-        expert_num = j + 1
-        ax6.hist(df[f'Expert{expert_num}_Weight'], bins=50, alpha=0.6, 
-                label=f'Expert {expert_num}', color=colors[j % len(colors)])
-    ax6.set_xlabel('Expert Weight')
-    ax6.set_ylabel('Count')
-    ax6.set_title('MoNIG Expert Weight Distribution')
-    ax6.legend()
-    if num_experts > 1:
-        ax6.axvline(1.0/num_experts, color='red', linestyle='--', alpha=0.5, label='Equal weight')
+    if num_experts > 0:
+        for j in range(num_experts):
+            expert_num = j + 1
+            if f'Expert{expert_num}_Weight' in df.columns:
+                ax6.hist(df[f'Expert{expert_num}_Weight'], bins=50, alpha=0.6, 
+                        label=f'Expert {expert_num}', color=colors[j % len(colors)])
+        ax6.set_xlabel('Expert Weight')
+        ax6.set_ylabel('Count')
+        ax6.set_title('MoNIG Expert Weight Distribution')
+        ax6.legend()
+        if num_experts > 1:
+            ax6.axvline(1.0/num_experts, color='red', linestyle='--', alpha=0.5, label='Equal weight')
+    else:
+        ax6.text(0.5, 0.5, 'No expert data available', 
+                ha='center', va='center', transform=ax6.transAxes)
+        ax6.set_title('MoNIG Expert Weight Distribution (N/A)')
     
     # Expert Disagreement vs MoNIG Epistemic
     ax7 = plt.subplot(3, 4, 7)
-    if 'Expert_Disagreement' not in df.columns:
-        # Compute if not already present
-        predictions = [df[f'Expert{j+1}_Prediction'].values for j in range(num_experts)]
-        max_disagreements = []
-        for i in range(len(df)):
-            max_disag = max(abs(predictions[j][i] - predictions[k][i]) 
-                          for j in range(num_experts) 
-                          for k in range(j+1, num_experts)) if num_experts >= 2 else 0.0
-            max_disagreements.append(max_disag)
-        df['Expert_Disagreement'] = max_disagreements
-    scatter = ax7.scatter(df['Expert_Disagreement'], df['MoNIG_Epistemic'], 
-                         c=df['MoNIG_Error'], alpha=0.5, s=30, cmap='plasma')
-    ax7.set_xlabel('Expert Disagreement (max pairwise)')
-    ax7.set_ylabel('MoNIG Epistemic Uncertainty')
-    ax7.set_title('Expert Disagreement vs Epistemic')
-    plt.colorbar(scatter, ax=ax7, label='Error')
+    if num_experts > 0:
+        if 'Expert_Disagreement' not in df.columns:
+            # Compute if not already present
+            predictions = [df[f'Expert{j+1}_Prediction'].values for j in range(num_experts)]
+            max_disagreements = []
+            for i in range(len(df)):
+                max_disag = max(abs(predictions[j][i] - predictions[k][i]) 
+                              for j in range(num_experts) 
+                              for k in range(j+1, num_experts)) if num_experts >= 2 else 0.0
+                max_disagreements.append(max_disag)
+            df['Expert_Disagreement'] = max_disagreements
+        scatter = ax7.scatter(df['Expert_Disagreement'], df['MoNIG_Epistemic'], 
+                             c=df['MoNIG_Error'], alpha=0.5, s=30, cmap='plasma')
+        ax7.set_xlabel('Expert Disagreement (max pairwise)')
+        ax7.set_ylabel('MoNIG Epistemic Uncertainty')
+        ax7.set_title('Expert Disagreement vs Epistemic')
+        plt.colorbar(scatter, ax=ax7, label='Error')
+    else:
+        ax7.text(0.5, 0.5, 'No expert data available', 
+                ha='center', va='center', transform=ax7.transAxes)
+        ax7.set_title('Expert Disagreement vs Epistemic (N/A)')
     
     # Confidence vs Error by Expert
     ax8 = plt.subplot(3, 4, 8)
-    for j in range(num_experts):
-        expert_num = j + 1
-        ax8.scatter(df[f'Expert{expert_num}_Confidence_nu'], df[f'Expert{expert_num}_Error'], 
-                   alpha=0.4, s=20, label=f'Expert {expert_num}', color=colors[j % len(colors)])
-    ax8.set_xlabel('Confidence (ν)')
-    ax8.set_ylabel('Prediction Error')
-    ax8.set_title('Confidence vs Error (by Expert)')
-    ax8.legend()
-    ax8.set_xscale('log')
+    if num_experts > 0:
+        for j in range(num_experts):
+            expert_num = j + 1
+            if f'Expert{expert_num}_Confidence_nu' in df.columns and f'Expert{expert_num}_Error' in df.columns:
+                ax8.scatter(df[f'Expert{expert_num}_Confidence_nu'], df[f'Expert{expert_num}_Error'], 
+                           alpha=0.4, s=20, label=f'Expert {expert_num}', color=colors[j % len(colors)])
+        ax8.set_xlabel('Confidence (ν)')
+        ax8.set_ylabel('Prediction Error')
+        ax8.set_title('Confidence vs Error (by Expert)')
+        ax8.legend()
+        ax8.set_xscale('log')
+    else:
+        ax8.text(0.5, 0.5, 'No expert data available', 
+                ha='center', va='center', transform=ax8.transAxes)
+        ax8.set_title('Confidence vs Error (N/A)')
     
     # Row 3: More analysis
     # MAE comparison
     ax9 = plt.subplot(3, 4, 9)
-    mae_data = [df[f'Expert{j+1}_Error'].mean() for j in range(num_experts)]
-    mae_data.append(df['MoNIG_Error'].mean())
-    mae_labels = [f'Expert {j+1}' for j in range(num_experts)] + ['MoNIG']
-    mae_colors = colors[:num_experts] + ['lightgreen']
-    bars = ax9.bar(mae_labels, mae_data, color=mae_colors)
-    ax9.set_ylabel('Mean Absolute Error')
-    ax9.set_title('Prediction Accuracy Comparison')
-    ax9.grid(axis='y', alpha=0.3)
-    # Add values on bars
-    for bar in bars:
-        height = bar.get_height()
-        ax9.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.3f}', ha='center', va='bottom')
+    if num_experts > 0:
+        mae_data = [df[f'Expert{j+1}_Error'].mean() for j in range(num_experts) if f'Expert{j+1}_Error' in df.columns]
+        mae_data.append(df['MoNIG_Error'].mean())
+        mae_labels = [f'Expert {j+1}' for j in range(num_experts) if f'Expert{j+1}_Error' in df.columns] + ['MoNIG']
+        mae_colors = colors[:len(mae_data)-1] + ['lightgreen']
+        bars = ax9.bar(mae_labels, mae_data, color=mae_colors)
+        ax9.set_ylabel('Mean Absolute Error')
+        ax9.set_title('Prediction Accuracy Comparison')
+        ax9.grid(axis='y', alpha=0.3)
+        # Add values on bars
+        for bar in bars:
+            height = bar.get_height()
+            ax9.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.3f}', ha='center', va='bottom')
+    else:
+        mae_data = [df['MoNIG_Error'].mean()]
+        bars = ax9.bar(['MoNIG'], mae_data, color=['lightgreen'])
+        ax9.set_ylabel('Mean Absolute Error')
+        ax9.set_title('Prediction Accuracy (MoNIG only)')
+        ax9.grid(axis='y', alpha=0.3)
+        for bar in bars:
+            height = bar.get_height()
+            ax9.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.3f}', ha='center', va='bottom')
     
     # Prediction scatter plots for experts (show first 2 experts)
     min_val = df['True_Affinity'].min()
     max_val = df['True_Affinity'].max()
+    expert_plots_created = 0
     for j in range(min(2, num_experts)):
         expert_num = j + 1
         ax_idx = 10 + j
-        if ax_idx <= 11:  # Only plot in ax10 and ax11
+        if ax_idx <= 11 and f'Expert{expert_num}_Prediction' in df.columns:  # Only plot in ax10 and ax11
             ax = plt.subplot(3, 4, ax_idx)
             ax.scatter(df['True_Affinity'], df[f'Expert{expert_num}_Prediction'], 
                       alpha=0.4, s=20, color=colors[j % len(colors)])
@@ -488,6 +547,13 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
             ax.set_ylabel(f'Expert {expert_num} Prediction')
             ax.set_title(f'Expert {expert_num}: Predicted vs True')
             ax.grid(alpha=0.3)
+            expert_plots_created += 1
+    # Fill empty subplots if fewer than 2 expert plots were created
+    for ax_idx in [10, 11]:
+        if ax_idx > 9 + expert_plots_created:
+            ax = plt.subplot(3, 4, ax_idx)
+            ax.text(0.5, 0.5, 'No expert data', ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Expert {ax_idx-9}: Predicted vs True (N/A)')
     
     # Prediction scatter: MoNIG vs True
     ax12 = plt.subplot(3, 4, 12)
@@ -504,51 +570,77 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
     print(f"\n  ✓ Saved: {custom_path}")
     plt.close()
     
-    # ===== 3. Focused expert diagnostics =====
-    fig_diag, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    # Compute bins from all experts
-    all_confidences = np.concatenate([df[f'Expert{j+1}_Confidence_nu'].values for j in range(num_experts)])
-    bins = np.logspace(np.log10(max(all_confidences.min(), 1e-3)),
-                       np.log10(all_confidences.max()), 40)
-    expert_names = ['GNINA', 'BIND', 'flowdock']
-    for j in range(num_experts):
-        expert_num = j + 1
-        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
-        axes[0].hist(df[f'Expert{expert_num}_Confidence_nu'], bins=bins, alpha=0.6, 
-                    label=f'Expert {expert_num} ({expert_name})', color=colors[j % len(colors)])
-    axes[0].set_xscale('log')
-    axes[0].set_xlabel('Confidence (ν)')
-    axes[0].set_ylabel('Count')
-    axes[0].set_title('Expert Confidence Distribution')
-    axes[0].legend()
-    
-    for j in range(num_experts):
-        expert_num = j + 1
-        axes[1].hist(df[f'Expert{expert_num}_Weight'], bins=40, alpha=0.7, 
-                    label=f'Expert {expert_num}', color=colors[j % len(colors)])
-    if num_experts > 1:
-        axes[1].axvline(1.0/num_experts, color='red', linestyle='--', linewidth=1.5, label='Equal weight')
-    axes[1].set_xlabel('Expert Weight')
-    axes[1].set_ylabel('Count')
-    axes[1].set_title('MoNIG Expert Weight Distribution')
-    axes[1].legend()
-    
-    maes = [df[f'Expert{j+1}_Error'].mean() for j in range(num_experts)]
-    maes.append(df['MoNIG_Error'].mean())
-    mae_labels = [f'Expert {j+1}' for j in range(num_experts)] + ['MoNIG']
-    mae_colors = colors[:num_experts] + ['#81c784']
-    axes[2].bar(mae_labels, maes, color=mae_colors)
-    axes[2].set_ylabel('Mean Absolute Error')
-    axes[2].set_title('Prediction Accuracy Comparison')
-    for idx, mae in enumerate(maes):
-        axes[2].text(idx, mae + 0.01, f"{mae:.3f}", ha='center', va='bottom', fontsize=11)
-    
-    plt.tight_layout()
-    diag_path = output_dir / f'{stem}_expert_stats.png'
-    plt.savefig(diag_path, dpi=300, bbox_inches='tight')
-    print(f"  ✓ Saved: {diag_path}")
-    plt.close(fig_diag)
+    # ===== 3. Focused expert diagnostics (only if experts are present) =====
+    if num_experts > 0:
+        fig_diag, axes = plt.subplots(1, 3, figsize=(18, 5))
+        
+        # Compute bins from all experts
+        expert_conf_cols = [f'Expert{j+1}_Confidence_nu' for j in range(num_experts) 
+                           if f'Expert{j+1}_Confidence_nu' in df.columns]
+        if expert_conf_cols:
+            all_confidences = np.concatenate([df[col].values for col in expert_conf_cols])
+            bins = np.logspace(np.log10(max(all_confidences.min(), 1e-3)),
+                               np.log10(all_confidences.max()), 40)
+            expert_names = ['GNINA', 'BIND', 'flowdock']
+            for j in range(num_experts):
+                expert_num = j + 1
+                if f'Expert{expert_num}_Confidence_nu' in df.columns:
+                    expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+                    axes[0].hist(df[f'Expert{expert_num}_Confidence_nu'], bins=bins, alpha=0.6, 
+                                label=f'Expert {expert_num} ({expert_name})', color=colors[j % len(colors)])
+            axes[0].set_xscale('log')
+            axes[0].set_xlabel('Confidence (ν)')
+            axes[0].set_ylabel('Count')
+            axes[0].set_title('Expert Confidence Distribution')
+            axes[0].legend()
+        else:
+            axes[0].text(0.5, 0.5, 'No expert confidence data', 
+                        ha='center', va='center', transform=axes[0].transAxes)
+            axes[0].set_title('Expert Confidence Distribution (N/A)')
+        
+        expert_weight_cols = [f'Expert{j+1}_Weight' for j in range(num_experts) 
+                              if f'Expert{j+1}_Weight' in df.columns]
+        if expert_weight_cols:
+            for j in range(num_experts):
+                expert_num = j + 1
+                if f'Expert{expert_num}_Weight' in df.columns:
+                    axes[1].hist(df[f'Expert{expert_num}_Weight'], bins=40, alpha=0.7, 
+                                label=f'Expert {expert_num}', color=colors[j % len(colors)])
+            if num_experts > 1:
+                axes[1].axvline(1.0/num_experts, color='red', linestyle='--', linewidth=1.5, label='Equal weight')
+            axes[1].set_xlabel('Expert Weight')
+            axes[1].set_ylabel('Count')
+            axes[1].set_title('MoNIG Expert Weight Distribution')
+            axes[1].legend()
+        else:
+            axes[1].text(0.5, 0.5, 'No expert weight data', 
+                        ha='center', va='center', transform=axes[1].transAxes)
+            axes[1].set_title('MoNIG Expert Weight Distribution (N/A)')
+        
+        expert_error_cols = [f'Expert{j+1}_Error' for j in range(num_experts) 
+                            if f'Expert{j+1}_Error' in df.columns]
+        if expert_error_cols:
+            maes = [df[col].mean() for col in expert_error_cols]
+            maes.append(df['MoNIG_Error'].mean())
+            mae_labels = [f'Expert {j+1}' for j in range(num_experts) if f'Expert{j+1}_Error' in df.columns] + ['MoNIG']
+            mae_colors = colors[:len(maes)-1] + ['#81c784']
+            axes[2].bar(mae_labels, maes, color=mae_colors)
+            axes[2].set_ylabel('Mean Absolute Error')
+            axes[2].set_title('Prediction Accuracy Comparison')
+            for idx, mae in enumerate(maes):
+                axes[2].text(idx, mae + 0.01, f"{mae:.3f}", ha='center', va='bottom', fontsize=11)
+        else:
+            maes = [df['MoNIG_Error'].mean()]
+            axes[2].bar(['MoNIG'], maes, color=['#81c784'])
+            axes[2].set_ylabel('Mean Absolute Error')
+            axes[2].set_title('Prediction Accuracy (MoNIG only)')
+            axes[2].text(0, maes[0] + 0.01, f"{maes[0]:.3f}", ha='center', va='bottom', fontsize=11)
+        
+        plt.tight_layout()
+        diag_path = output_dir / f'{stem}_expert_stats.png'
+        plt.savefig(diag_path, dpi=300, bbox_inches='tight')
+        print(f"  ✓ Saved: {diag_path}")
+        plt.close(fig_diag)
     
     print(f"\n✅ All visualizations saved under: {output_dir.resolve()}")
 

@@ -167,29 +167,55 @@ ComplexID,Binding_Affinity,GNINA_Affinity,BIND_pIC50,Emb_0,Emb_1,...,Emb_703
 The MoNIG architecture combines expert predictions with molecular embeddings:
 
 ```
-Expert i                                Molecular embeddings (704-dim)
-────────┐                                ┌──────────────────────────────┐
-        │                                │  Linear → ReLU → Dropout     │
-Raw score (Eᵢ) -- Calibratorᵢ --┐       │  Linear → ReLU → Dropout     │
-                                 ├─Concat┴──────────────────────────────┘
-                                 │
-                 Context-aware Evidential Headᵢ
-                 ├─ fusion MLP (hidden_dim)
-                 ├─ μ head → μᵢ (mean)
-                 ├─ ν head → νᵢ (precision, softplus)
-                 ├─ α head → αᵢ (shape, softplus + 1)
-                 └─ β head → βᵢ (scale, softplus)
+Molecular embeddings (704-dim)
+┌─────────────────────────────────────────────┐
+│  Shared Embedding Tower (all experts)      │
+│  Linear(hidden_dim) → ReLU → Dropout       │
+│  Linear(hidden_dim) → ReLU → Dropout       │
+└──────────────────┬──────────────────────────┘
+                   │ emb_feat [hidden_dim]
+                   │
+Expert i           │
+────────┐          │
+        │          │
+Raw score (Eᵢ) ────┼─── Normalize (per-batch, training)
+        │          │    Dropout (p=0.2, training)
+        │          │
+        │          │    ┌──────────────────────────┐
+        └─ Score MLP_i ─┤  Linear(score_hidden)    │
+          (small)       │  → ReLU → Dropout        │
+                        │  Linear(score_hidden)    │
+                        └───┬──────────────────────┘
+                            │ score_feat [score_hidden]
+                            │
+                            │ Late Fusion (Concat)
+                            ├──────────────────────┐
+                            │                      │
+                            ▼                      ▼
+                    ┌─────────────────────────────────────┐
+                    │  Unified NIG Head_i                 │
+                    │  Linear(hidden_dim) → ReLU → Dropout│
+                    │  Linear(4) → [μ, log_ν, log_α, log_β]│
+                    └─────────────────────────────────────┘
+                            │
+                            ▼
+                    (μᵢ, νᵢ, αᵢ, βᵢ)
+                    with constraints:
+                    ν > v_min, α > 1 + alpha_min, β > beta_min
 
-MoNIG Aggregator (Equation 9)
+MoNIG Aggregator (Equation 9) with Precision Tempering
 NIG₁ ⊕ NIG₂ ⊕ … ⊕ NIG_k → Combined NIG(μ, ν, α, β)
 ```
 
 **Key Components:**
 
-1. **Per-Expert Calibrators**: Adjust raw expert scores
-2. **Embedding Encoder**: Reduces 704-dim embeddings to 64-dim context
-3. **Evidential Heads**: Each expert gets its own NIG parameter predictor
-4. **MoNIG Aggregator**: Combines multiple NIG distributions using closed-form formulas
+1. **Shared Embedding Tower**: Single MLP processes embeddings for all experts (parameter-efficient)
+2. **Per-Expert Score Towers**: Small MLPs (hidden_dim//4) process each expert's scalar score independently
+3. **Late Fusion**: Concatenates embedding features and score features before NIG head
+4. **Unified NIG Heads**: Each expert has a single head that outputs all 4 NIG parameters (μ, ν, α, β) simultaneously
+5. **Expert Dropout**: Randomly zeros out expert scores during training (p=0.2) for regularization
+6. **Per-Batch Normalization**: Normalizes expert scores per batch during training
+7. **MoNIG Aggregator**: Combines multiple NIG distributions using closed-form formulas with precision tempering
 
 **Uncertainty Decomposition:**
 - **Epistemic uncertainty** = β / (ν × (α - 1)) - model uncertainty

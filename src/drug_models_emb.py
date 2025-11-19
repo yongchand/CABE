@@ -1,137 +1,233 @@
 import torch
-from torch import nn
+import torch.nn as nn
 import torch.nn.functional as F
 
 
 class DrugDiscoveryMoNIGEmb(nn.Module):
     """
-    Drug Discovery model using Mixture of Normal-Inverse Gamma (MoNIG) with embeddings
-    
-    Architecture:
-    - Input: Expert Scores + Molecular Embeddings (704-dim)
-    - Per-expert: Calibrator → Context-Aware Evidential Head → NIG parameters
-    - MoNIG Aggregator: Combine all expert NIGs
+    Mixture-of-NIG model with expert scores + molecular embeddings.
+
+    Key points:
+    - Embeddings are pre-normalized in the dataset.
+    - Expert scores are z-scored inside the model using dataset-level stats
+      (mean/std per expert passed via hyp_params.score_mean / score_std).
     """
+
     def __init__(self, hyp_params):
-        super(DrugDiscoveryMoNIGEmb, self).__init__()
-        
+        super().__init__()
+
         self.num_experts = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
-        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
-        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        self.hidden_dim = getattr(hyp_params, "hidden_dim", 256)
+        self.dropout = getattr(hyp_params, "dropout", 0.2)
+
+        # ---- NIG parameter lower bounds to avoid degeneracy ----
+        self.v_min = 1e-4
+        self.alpha_min = 1e-4
+        self.beta_min = 1e-4
+
+        # Expert dropout probability
+        self.expert_dropout_p = getattr(hyp_params, "expert_dropout_p", 0.2)
         
-        # Embedding encoder (reduce dimension from 704 to manageable size)
-        self.embedding_encoder = nn.Sequential(
-            nn.Linear(self.embedding_dim, 256),
+        # Expert balance normalization: normalize expert precisions to prevent dominance
+        self.use_expert_normalization = getattr(hyp_params, "use_expert_normalization", True)
+        self.expert_normalization_strength = getattr(hyp_params, "expert_normalization_strength", 0.5)
+
+        # ---- Dataset-level score normalization stats (buffers) ----
+        if hasattr(hyp_params, "score_mean") and hasattr(hyp_params, "score_std"):
+            score_mean = torch.as_tensor(
+                hyp_params.score_mean, dtype=torch.float32
+            ).view(-1)
+            score_std = torch.as_tensor(
+                hyp_params.score_std, dtype=torch.float32
+            ).view(-1)
+            if score_mean.numel() != self.num_experts or score_std.numel() != self.num_experts:
+                raise ValueError(
+                    f"score_mean/std must have length {self.num_experts}, "
+                    f"got {score_mean.numel()} / {score_std.numel()}"
+                )
+        else:
+            score_mean = torch.zeros(self.num_experts, dtype=torch.float32)
+            score_std = torch.ones(self.num_experts, dtype=torch.float32)
+
+        self.register_buffer("score_mean", score_mean)
+        self.register_buffer("score_std", score_std)
+
+        # ---- Shared embedding MLP ----
+        self.embedding_mlp = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.dropout),
-            nn.Linear(256, 128),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(self.dropout),
-            nn.Linear(128, 64),
-            nn.ReLU(),
         )
-        
-        # Per-expert calibrators (adjust expert scores)
-        self.calibrators = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(1, 64),
-                nn.ReLU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(64, 32),
-                nn.ReLU(),
-                nn.Linear(32, 1)
-            ) for _ in range(self.num_experts)
-        ])
-        
-        # Per-expert evidential heads
-        self.evidential_heads = nn.ModuleList([
-            self._build_evidential_head() for _ in range(self.num_experts)
-        ])
-    
-    def _build_evidential_head(self):
-        """
-        Context-aware evidential head that produces NIG parameters
-        Input: embedding context (64) + calibrated expert score (1)
-        Output: μ, ν, α, β (NIG parameters)
-        """
-        return nn.ModuleDict({
-            'fusion': nn.Sequential(
-                nn.Linear(64 + 1, self.hidden_dim),  # Embedding context (64) + Score (1)
-                nn.ReLU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(self.hidden_dim, 128),
-                nn.ReLU(),
-                nn.Dropout(self.dropout),
-                nn.Linear(128, 64),
-                nn.ReLU(),
-            ),
-            'mu_head': nn.Linear(64, 1),      # Mean
-            'v_head': nn.Linear(64, 1),       # Precision parameter
-            'alpha_head': nn.Linear(64, 1),   # Shape parameter
-            'beta_head': nn.Linear(64, 1),    # Scale parameter
-        })
-    
-    def evidence(self, x):
-        """Apply softplus to ensure positive values"""
-        return F.softplus(x)
-    
+
+        # ---- Per-expert embedding projection ----
+        self.embedding_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+        # ---- Per-expert score towers (z-scored scores in, richer MLP) ----
+        score_hidden = max(self.hidden_dim // 2, 32)
+        self.score_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(1, score_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(score_hidden, score_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(score_hidden, score_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+        # ---- Gating MLPs to scale precision parameters (v, alpha) ----
+        gate_hidden = max(self.hidden_dim // 4, 16)
+        self.gating_networks = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.hidden_dim + score_hidden, gate_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(gate_hidden, 2),
+                    nn.Sigmoid(),  # outputs in (0, 1)
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
+        # ---- NIG heads per expert ----
+        head_input_dim = self.hidden_dim + score_hidden
+        head_hidden = self.hidden_dim
+        self.nig_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(head_input_dim, head_hidden),
+                    nn.ReLU(),
+                    nn.Dropout(self.dropout),
+                    nn.Linear(head_hidden, 4),  # mu, log_v, log_alpha_shift, log_beta
+                )
+                for _ in range(self.num_experts)
+            ]
+        )
+
     def forward(self, expert_scores, embeddings):
         """
-        Forward pass
-        
-        Args:
-            expert_scores: [batch, num_experts] - Pre-computed expert predictions
-            embeddings: [batch, embedding_dim] - Molecular/protein embeddings
-        
+        expert_scores: [B, E] raw scores
+        embeddings:    [B, D] pre-normalized embeddings
+
         Returns:
-            List of (mu, v, alpha, beta) tuples, one per expert
+            list of (mu, v, alpha, beta) for each expert, each of shape [B, 1]
         """
-        batch_size = expert_scores.shape[0]
-        
-        # Encode embeddings to lower dimension
-        emb_encoded = self.embedding_encoder(embeddings)  # [batch, 64]
-        
-        # Process each expert
+        B, E = expert_scores.shape
+        if E != self.num_experts:
+            raise ValueError(
+                f"Expected expert_scores with {self.num_experts} experts, got {E}"
+            )
+
+        shared_emb = self.embedding_mlp(embeddings)  # [B, H]
+
         nigs = []
-        for i in range(self.num_experts):
-            # Step 1: Calibrate expert score
-            expert_i = expert_scores[:, i:i+1]  # [batch, 1]
-            calibrated = self.calibrators[i](expert_i)  # [batch, 1]
-            
-            # Step 2: Fuse calibrated score with embedding context
-            head = self.evidential_heads[i]
-            fused = head['fusion'](torch.cat([emb_encoded, calibrated], dim=1))  # [batch, 64]
-            
-            # Step 3: Predict NIG parameters
-            mu = head['mu_head'](fused)          # [batch, 1]
-            logv = head['v_head'](fused)         # [batch, 1]
-            logalpha = head['alpha_head'](fused) # [batch, 1]
-            logbeta = head['beta_head'](fused)   # [batch, 1]
-            
-            # Step 4: Apply evidence function to ensure proper parameter ranges
-            v = self.evidence(logv)              # ν > 0
-            alpha = self.evidence(logalpha) + 1  # α > 1
-            beta = self.evidence(logbeta)        # β > 0
-            
+
+        for k in range(self.num_experts):
+            # Select scalar score for expert k: [B, 1]
+            score_k = expert_scores[:, k : k + 1]
+
+            # ---- Z-score normalization using dataset-level stats ----
+            mean_k = self.score_mean[k].view(1, 1)
+            std_k = self.score_std[k].view(1, 1)
+            score_k = (score_k - mean_k) / (std_k + 1e-6)
+
+            # ---- Expert dropout ----
+            if self.training and self.expert_dropout_p > 0.0:
+                mask = (torch.rand_like(score_k) > self.expert_dropout_p).float()
+                score_k = score_k * mask
+
+            # ---- Per-expert embedding projection + score tower ----
+            emb_k = self.embedding_projections[k](shared_emb)  # [B, H]
+            score_feat = self.score_mlps[k](score_k)  # [B, score_hidden]
+
+            fused = torch.cat([emb_k, score_feat], dim=-1)  # [B, H + score_hidden]
+
+            # Gating to scale v, alpha
+            gate_out = self.gating_networks[k](fused)  # [B, 2]
+            gate_v = gate_out[:, 0:1]
+            gate_alpha = gate_out[:, 1:2]
+
+            # NIG params
+            out = self.nig_heads[k](fused)  # [B, 4]
+            mu, log_v, log_alpha_shift, log_beta = torch.split(out, 1, dim=-1)
+
+            v_raw = F.softplus(log_v) + self.v_min
+            alpha_raw = F.softplus(log_alpha_shift) + 1.0 + self.alpha_min
+            beta = F.softplus(log_beta) + self.beta_min
+
+            # Scale v and alpha by gate factors (more constrained ranges to prevent dominance)
+            # Constrain v scaling to 0.2–1.5 (reduced from 0.1–2.0) to prevent single expert dominance
+            v = v_raw * (0.2 + 1.3 * gate_v)
+            # Constrain alpha scaling to 0.6–1.8 (reduced from 0.5–2.0)
+            alpha = alpha_raw * (0.6 + 1.2 * gate_alpha)
+
             nigs.append((mu, v, alpha, beta))
-        
+
+        # Normalize expert precisions to prevent dominance
+        if self.use_expert_normalization and len(nigs) > 1:
+            # Extract all v values
+            vs = torch.stack([v for _, v, _, _ in nigs], dim=0)  # [E, B, 1]
+            vs_mean = vs.mean(dim=0, keepdim=True)  # [1, B, 1]
+            vs_max = vs.max(dim=0, keepdim=True)[0]
+            vs_min = vs.min(dim=0, keepdim=True)[0]
+            
+            # Very aggressive normalization: compress differences toward mean
+            # Use stronger compression to prevent any expert from dominating
+            compression = self.expert_normalization_strength
+            vs_normalized = vs_mean + (vs - vs_mean) * (1.0 - compression)
+            
+            # Additional: cap max/min ratio to prevent extreme dominance
+            # If max/min ratio > 2.0, compress further
+            max_min_ratio = (vs_max / (vs_min + 1e-6))
+            ratio_mask = (max_min_ratio > 2.0).float()
+            # Extra compression when ratio is too high
+            extra_compression = ratio_mask * 0.3  # Additional 30% compression
+            vs_normalized = vs_mean + (vs_normalized - vs_mean) * (1.0 - extra_compression)
+            
+            vs_normalized = torch.clamp(vs_normalized, min=1e-6)
+            
+            # Replace v values with normalized ones
+            normalized_nigs = []
+            for i, (mu, _, alpha, beta) in enumerate(nigs):
+                normalized_nigs.append((mu, vs_normalized[i], alpha, beta))
+            nigs = normalized_nigs
+
         return nigs
 
 
 class DrugDiscoveryNIGEmb(nn.Module):
     """
-    Baseline: Single NIG model without mixture of experts (with embeddings)
+    Single NIG model (no mixture) with expert scores + embeddings.
     """
+
     def __init__(self, hyp_params):
-        super(DrugDiscoveryNIGEmb, self).__init__()
-        
+        super().__init__()
+
         self.expert_dim = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
-        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
-        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
-        
-        # Encoder
+        self.hidden_dim = getattr(hyp_params, "hidden_dim", 256)
+        self.dropout = getattr(hyp_params, "dropout", 0.2)
+
         self.encoder = nn.Sequential(
             nn.Linear(self.expert_dim + self.embedding_dim, 512),
             nn.ReLU(),
@@ -145,55 +241,44 @@ class DrugDiscoveryNIGEmb(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
         )
-        
-        # NIG parameter heads
+
         self.mu_head = nn.Linear(64, 1)
         self.v_head = nn.Linear(64, 1)
         self.alpha_head = nn.Linear(64, 1)
         self.beta_head = nn.Linear(64, 1)
-    
-    def evidence(self, x):
+
+    @staticmethod
+    def evidence(x):
         return F.softplus(x)
-    
+
     def forward(self, expert_scores, embeddings):
-        """
-        Forward pass
-        Returns single NIG distribution
-        """
-        # Concatenate all inputs
         x = torch.cat([expert_scores, embeddings], dim=1)
-        
-        # Encode
-        encoded = self.encoder(x)
-        
-        # Predict NIG parameters
-        mu = self.mu_head(encoded)
-        logv = self.v_head(encoded)
-        logalpha = self.alpha_head(encoded)
-        logbeta = self.beta_head(encoded)
-        
-        # Apply evidence function
+        h = self.encoder(x)
+
+        mu = self.mu_head(h)
+        logv = self.v_head(h)
+        logalpha = self.alpha_head(h)
+        logbeta = self.beta_head(h)
+
         v = self.evidence(logv)
-        alpha = self.evidence(logalpha) + 1
+        alpha = self.evidence(logalpha) + 1.0
         beta = self.evidence(logbeta)
-        
         return mu, v, alpha, beta
 
 
 class DrugDiscoveryGaussianEmb(nn.Module):
     """
-    Gaussian model: Predicts mean and variance (simpler than NIG)
-    Output: μ (mean) and σ² (variance)
+    Gaussian model: predict mean + variance (σ²) from scores + embeddings.
     """
+
     def __init__(self, hyp_params):
-        super(DrugDiscoveryGaussianEmb, self).__init__()
-        
+        super().__init__()
+
         self.expert_dim = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
-        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
-        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
-        
-        # Encoder
+        self.hidden_dim = getattr(hyp_params, "hidden_dim", 256)
+        self.dropout = getattr(hyp_params, "dropout", 0.2)
+
         self.encoder = nn.Sequential(
             nn.Linear(self.expert_dim + self.embedding_dim, 512),
             nn.ReLU(),
@@ -207,49 +292,36 @@ class DrugDiscoveryGaussianEmb(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
         )
-        
-        # Output heads
-        self.mu_head = nn.Linear(64, 1)      # Mean
-        self.sigma_head = nn.Linear(64, 1)  # Variance
-    
-    def evidence(self, x):
-        """Ensure positive variance"""
+
+        self.mu_head = nn.Linear(64, 1)
+        self.sigma_head = nn.Linear(64, 1)
+
+    @staticmethod
+    def evidence(x):
         return F.softplus(x)
-    
+
     def forward(self, expert_scores, embeddings):
-        """
-        Forward pass
-        
-        Returns:
-            mu: predicted mean [batch, 1]
-            sigma: predicted variance [batch, 1] (must be positive)
-        """
-        # Concatenate all inputs
         x = torch.cat([expert_scores, embeddings], dim=1)
-        
-        # Encode
-        encoded = self.encoder(x)
-        
-        # Predict mean and variance
-        mu = self.mu_head(encoded)
-        log_sigma = self.sigma_head(encoded)
-        sigma = self.evidence(log_sigma)  # Ensure σ² > 0
-        
+        h = self.encoder(x)
+        mu = self.mu_head(h)
+        log_sigma = self.sigma_head(h)
+        sigma = self.evidence(log_sigma)
         return mu, sigma
 
 
 class DrugDiscoveryBaselineEmb(nn.Module):
     """
-    Simple baseline: MLP regression without uncertainty (with embeddings)
+    Simple MLP baseline: scores + embeddings -> scalar regression.
     """
+
     def __init__(self, hyp_params):
-        super(DrugDiscoveryBaselineEmb, self).__init__()
-        
+        super().__init__()
+
         self.expert_dim = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
-        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
-        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
-        
+        self.hidden_dim = getattr(hyp_params, "hidden_dim", 256)
+        self.dropout = getattr(hyp_params, "dropout", 0.2)
+
         self.model = nn.Sequential(
             nn.Linear(self.expert_dim + self.embedding_dim, 512),
             nn.ReLU(),
@@ -262,9 +334,9 @@ class DrugDiscoveryBaselineEmb(nn.Module):
             nn.Dropout(self.dropout),
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Linear(64, 1),
         )
-    
+
     def forward(self, expert_scores, embeddings):
         x = torch.cat([expert_scores, embeddings], dim=1)
         return self.model(x)
