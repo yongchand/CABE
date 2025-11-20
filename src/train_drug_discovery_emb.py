@@ -39,14 +39,10 @@ def aggregate_nigs(nigs):
 def criterion_nig(u, la, alpha, beta, y, risk_weight=0.01):
     """
     Thin wrapper for criterion_nig from utils.py
-    Only adapts the interface (risk_weight -> hyp_params.risk)
+    Passes risk_weight directly as a scalar
     """
-    class HypParams:
-        pass
-    hyp = HypParams()
-    hyp.risk = risk_weight
     # Direct call to original criterion_nig from utils.py
-    return criterion_nig_original(u, la, alpha, beta, y, hyp)
+    return criterion_nig_original(u, la, alpha, beta, y, risk_weight)
 
 
 def nig_uncertainty(v, alpha, beta):

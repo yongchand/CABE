@@ -18,7 +18,7 @@ class DrugDiscoveryDatasetEmb(Dataset):
         csv_path,
         split: str = "train",
         train_ratio: float = 0.8,
-        val_ratio: float = 0.1,
+        val_ratio: float = 0.2,
         seed: int = 42,
         normalization_stats=None,
         test_ids_path: str = "data/test.csv",
