@@ -10,11 +10,11 @@ class DrugDiscoveryDatasetEmb(Dataset):
     Dataset for drug discovery with expert scores and molecular embeddings.
     
     Supports:
-    - Excluding CASF 2016 dataset for separate test set
-    - Random 80/10/10 split ratio (train/valid/test)
+    - Using test set IDs from data/test.csv for separate test set
+    - Random 80/20 split ratio (train/valid) after excluding test set
     """
-    def __init__(self, csv_path, split='train', train_ratio=0.8, val_ratio=0.1,
-                 seed=42, normalization_stats=None, casf2016_pdb_ids=None):
+    def __init__(self, csv_path, split='train', train_ratio=0.8, val_ratio=0.2,
+                 seed=42, normalization_stats=None, test_pdb_ids=None):
         super(DrugDiscoveryDatasetEmb, self).__init__()
         
         # Load data
@@ -48,47 +48,47 @@ class DrugDiscoveryDatasetEmb(Dataset):
         complex_ids = df['ComplexID'].values[valid_indices]
         year_folders = df['YearFolder'].values[valid_indices] if 'YearFolder' in df.columns else None
         
-        # Handle CASF 2016: exclude for train/val/test, include only for casf2016 split
-        if split == 'casf2016':
-            # For CASF 2016 split, we want ONLY CASF 2016 complexes
-            if casf2016_pdb_ids is None:
-                raise ValueError("CASF 2016 PDB IDs must be provided for casf2016 split")
-            casf2016_set = set(str(pdb_id).lower() for pdb_id in casf2016_pdb_ids)
-            casf_mask = np.array([str(cid).lower() in casf2016_set for cid in complex_ids])
-            print(f"Including {np.sum(casf_mask)} CASF 2016 samples")
+        # Handle test set: exclude test IDs from train/val, include only for test split
+        if split == 'test':
+            # For test split, we want ONLY test set complexes
+            if test_pdb_ids is None:
+                raise ValueError("Test PDB IDs must be provided for test split")
+            test_set = set(str(pdb_id).lower() for pdb_id in test_pdb_ids)
+            test_mask = np.array([str(cid).lower() in test_set for cid in complex_ids])
+            print(f"Including {np.sum(test_mask)} test samples")
             
-            if np.sum(casf_mask) == 0:
-                raise ValueError("No CASF 2016 samples found in dataset")
+            if np.sum(test_mask) == 0:
+                raise ValueError("No test samples found in dataset")
             
-            embeddings = embeddings[casf_mask]
-            expert_scores = expert_scores[casf_mask]
-            labels = labels[casf_mask]
-            complex_ids = complex_ids[casf_mask]
+            embeddings = embeddings[test_mask]
+            expert_scores = expert_scores[test_mask]
+            labels = labels[test_mask]
+            complex_ids = complex_ids[test_mask]
             if year_folders is not None:
-                year_folders = year_folders[casf_mask]
-            valid_indices = valid_indices[casf_mask]
+                year_folders = year_folders[test_mask]
+            valid_indices = valid_indices[test_mask]
             
-            # For CASF 2016, we don't need to split - use all samples
+            # For test split, we don't need to split - use all samples
             train_indices = np.array([], dtype=np.int64)
             val_indices = np.array([], dtype=np.int64)
             test_indices = np.array([], dtype=np.int64)
-        elif casf2016_pdb_ids is not None:
-            # Exclude CASF 2016 for train/val/test splits
-            casf2016_set = set(str(pdb_id).lower() for pdb_id in casf2016_pdb_ids)
-            non_casf_mask = np.array([str(cid).lower() not in casf2016_set for cid in complex_ids])
+        elif test_pdb_ids is not None:
+            # Exclude test set for train/val splits
+            test_set = set(str(pdb_id).lower() for pdb_id in test_pdb_ids)
+            non_test_mask = np.array([str(cid).lower() not in test_set for cid in complex_ids])
             if split == 'train':
-                print(f"Excluding {np.sum(~non_casf_mask)} CASF 2016 samples")
+                print(f"Excluding {np.sum(~non_test_mask)} test samples")
             
-            embeddings = embeddings[non_casf_mask]
-            expert_scores = expert_scores[non_casf_mask]
-            labels = labels[non_casf_mask]
-            complex_ids = complex_ids[non_casf_mask]
+            embeddings = embeddings[non_test_mask]
+            expert_scores = expert_scores[non_test_mask]
+            labels = labels[non_test_mask]
+            complex_ids = complex_ids[non_test_mask]
             if year_folders is not None:
-                year_folders = year_folders[non_casf_mask]
-            valid_indices = valid_indices[non_casf_mask]
+                year_folders = year_folders[non_test_mask]
+            valid_indices = valid_indices[non_test_mask]
         
-        # Random split (80/10/10) - skip for CASF 2016 split
-        if split != 'casf2016':
+        # Random split (80/20) for train/val - skip for test split
+        if split != 'test':
             np.random.seed(seed)
             n_samples = len(valid_indices)
             indices = np.random.permutation(n_samples)
@@ -110,15 +110,15 @@ class DrugDiscoveryDatasetEmb(Dataset):
         # Fit or reuse normalization stats
         # IMPORTANT: normalization_stats must always come from TRAINING data only
         # to prevent data leakage. Stats should be computed from train split and
-        # reused for valid/test/casf2016 splits.
+        # reused for valid/test splits.
         if normalization_stats is not None:
             self.emb_mean = np.asarray(normalization_stats['mean'], dtype=np.float32)
             self.emb_std = np.asarray(normalization_stats['std'], dtype=np.float32)
         else:
-            if split not in ['train', 'casf2016']:
+            if split not in ['train']:
                 raise ValueError("Normalization stats must be provided for non-training splits")
-            if split == 'casf2016':
-                raise ValueError("Normalization stats must be provided for casf2016 split (use stats from training)")
+            if split == 'test':
+                raise ValueError("Normalization stats must be provided for test split (use stats from training)")
             # Compute normalization stats from TRAINING data only
             train_embeddings = embeddings[train_indices]
             self.emb_mean = train_embeddings.mean(axis=0).astype(np.float32)
@@ -134,12 +134,10 @@ class DrugDiscoveryDatasetEmb(Dataset):
         elif split == 'valid':
             idx = val_indices
         elif split == 'test':
-            idx = test_indices
-        elif split == 'casf2016':
-            # For CASF 2016, use all samples (already filtered above)
+            # For test split, use all samples (already filtered above)
             idx = np.arange(len(embeddings), dtype=np.int64)
         else:
-            raise ValueError(f"Unknown split: {split}. Must be 'train', 'valid', 'test', or 'casf2016'")
+            raise ValueError(f"Unknown split: {split}. Must be 'train', 'valid', or 'test'")
         
         # Store tensors
         self.embeddings = torch.tensor(embeddings[idx]).cpu()

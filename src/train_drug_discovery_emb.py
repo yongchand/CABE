@@ -4,6 +4,7 @@ import pickle
 import random
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -362,20 +363,20 @@ def main():
     # Set seed
     set_seed(args.seed)
     
-    # Load CASF 2016 PDB IDs from ground truth file
-    casf2016_pdb_ids = None
-    casf2016_file = 'data/coreset_dirs.csv'
-    if os.path.isfile(casf2016_file):
-        # Read from file (one PDB ID per line, skip header if present)
-        with open(casf2016_file, 'r') as f:
-            lines = [line.strip() for line in f if line.strip()]
-            # Skip header if it looks like a header (contains "directory" or similar)
-            if len(lines) > 0 and ('directory' in lines[0].lower() or 'pdb' in lines[0].lower()):
-                lines = lines[1:]
-            casf2016_pdb_ids = lines
-        print(f"Loaded {len(casf2016_pdb_ids)} CASF 2016 PDB IDs from {casf2016_file}")
+    # Load test set PDB IDs from test.csv file
+    test_pdb_ids = None
+    test_file = 'data/test.csv'
+    if os.path.isfile(test_file):
+        # Read from CSV file (expecting 'name' column with PDB IDs)
+        test_df = pd.read_csv(test_file)
+        if 'name' in test_df.columns:
+            test_pdb_ids = test_df['name'].astype(str).tolist()
+        else:
+            # Fallback: use first column
+            test_pdb_ids = test_df.iloc[:, 0].astype(str).tolist()
+        print(f"Loaded {len(test_pdb_ids)} test PDB IDs from {test_file}")
     else:
-        print(f"Warning: CASF 2016 file not found at {casf2016_file}, proceeding without exclusion")
+        raise FileNotFoundError(f"Test file not found at {test_file}. Please provide data/test.csv")
     
     print("="*50)
     print("Drug Discovery with MoNIG (Embeddings)")
@@ -384,24 +385,23 @@ def main():
     print(f"Expert Config: {expert_config}")
     print(f"Device: {args.device}")
     print(f"CSV: {args.csv_path}")
-    if casf2016_pdb_ids:
-        print(f"CASF 2016 excluded: {len(casf2016_pdb_ids)} complexes")
+    print(f"Test set: {len(test_pdb_ids)} complexes")
     print("="*50)
     
     # Load datasets
     print("\nLoading datasets...")
     train_dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split='train', seed=args.seed, casf2016_pdb_ids=casf2016_pdb_ids)
+        args.csv_path, split='train', seed=args.seed, test_pdb_ids=test_pdb_ids)
     norm_stats = {
         'mean': train_dataset.emb_mean,
         'std': train_dataset.emb_std
     }
     valid_dataset = DrugDiscoveryDatasetEmb(
         args.csv_path, split='valid', seed=args.seed, normalization_stats=norm_stats,
-        casf2016_pdb_ids=casf2016_pdb_ids)
+        test_pdb_ids=test_pdb_ids)
     test_dataset = DrugDiscoveryDatasetEmb(
         args.csv_path, split='test', seed=args.seed, normalization_stats=norm_stats,
-        casf2016_pdb_ids=casf2016_pdb_ids)
+        test_pdb_ids=test_pdb_ids)
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
@@ -561,7 +561,7 @@ def main():
             print(f"  Mean Predicted Std Dev: {test_metrics['mean_std']:.4f}")
     else:
         print("\nTest Results: [Skipped - test set is empty]")
-        print("Note: Run inference separately on test split or CASF 2016 for evaluation")
+        print("Note: Run inference separately on test split for evaluation")
     print("="*50)
 
 

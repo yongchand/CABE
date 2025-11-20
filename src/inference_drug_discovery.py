@@ -212,8 +212,8 @@ def main():
     
     # Data split
     parser.add_argument('--split', type=str, default='test',
-                       choices=['train', 'valid', 'test', 'casf2016'],
-                       help='Which split to run inference on (test=internal test set, casf2016=CASF 2016 benchmark)')
+                       choices=['train', 'valid', 'test'],
+                       help='Which split to run inference on')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size')
     
@@ -237,20 +237,20 @@ def main():
     # Set seed for reproducibility
     set_seed(0)
     
-    # Load CASF 2016 PDB IDs from ground truth file
-    casf2016_pdb_ids = None
-    casf2016_file = 'data/coreset_dirs.csv'
-    if os.path.isfile(casf2016_file):
-        # Read from file (one PDB ID per line, skip header if present)
-        with open(casf2016_file, 'r') as f:
-            lines = [line.strip() for line in f if line.strip()]
-            # Skip header if it looks like a header (contains "directory" or similar)
-            if len(lines) > 0 and ('directory' in lines[0].lower() or 'pdb' in lines[0].lower()):
-                lines = lines[1:]
-            casf2016_pdb_ids = lines
-        print(f"Loaded {len(casf2016_pdb_ids)} CASF 2016 PDB IDs from {casf2016_file}")
+    # Load test set PDB IDs from test.csv file
+    test_pdb_ids = None
+    test_file = 'data/test.csv'
+    if os.path.isfile(test_file):
+        # Read from CSV file (expecting 'name' column with PDB IDs)
+        test_df = pd.read_csv(test_file)
+        if 'name' in test_df.columns:
+            test_pdb_ids = test_df['name'].astype(str).tolist()
+        else:
+            # Fallback: use first column
+            test_pdb_ids = test_df.iloc[:, 0].astype(str).tolist()
+        print(f"Loaded {len(test_pdb_ids)} test PDB IDs from {test_file}")
     else:
-        print(f"Warning: CASF 2016 file not found at {casf2016_file}, proceeding without exclusion")
+        raise FileNotFoundError(f"Test file not found at {test_file}. Please provide data/test.csv")
     
     print("="*70)
     print("MoNIG Inference - Expert Analysis")
@@ -261,8 +261,7 @@ def main():
     print(f"Split: {args.split}")
     print(f"Output: {args.output_path}")
     print(f"Device: {args.device}")
-    if casf2016_pdb_ids:
-        print(f"CASF 2016 excluded: {len(casf2016_pdb_ids)} complexes")
+    print(f"Test set: {len(test_pdb_ids)} complexes")
     print("="*70)
     # Load normalization stats
     if args.norm_stats_path is not None:
@@ -294,7 +293,7 @@ def main():
     print(f"\nLoading {args.split} dataset...")
     dataset = DrugDiscoveryDatasetEmb(
         args.csv_path, split=args.split, normalization_stats=norm_stats,
-        casf2016_pdb_ids=casf2016_pdb_ids)
+        test_pdb_ids=test_pdb_ids)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     
     # Get dimensions
