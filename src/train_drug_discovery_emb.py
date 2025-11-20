@@ -13,7 +13,7 @@ import uncertainty_toolbox as uct
 
 from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb, DrugDiscoveryBaselineEmb
-from src.utils import moe_nig, criterion_nig as criterion_nig_original
+from src.utils import moe_nig, criterion_nig as criterion_nig_original, nig_nll_loss, evidential_regularizer
 
 
 def aggregate_nigs(nigs):
@@ -134,10 +134,15 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
             
             # Compute loss for each expert + aggregated
             loss = 0
+            # 1. Per-expert losses (with regularizer)
             for mu, v, alpha, beta in nigs:
-                loss += criterion_nig(mu, v, alpha, beta, labels, risk_weight)
-            loss += criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
-            loss = loss / (len(nigs) + 1)  # Average
+                nll_expert = nig_nll_loss(mu, v, alpha, beta, labels)
+                reg_expert = evidential_regularizer(mu, v, alpha, labels)
+                loss += nll_expert + risk_weight * reg_expert
+
+            # 2. Aggregated NIG (NO regularizer)
+            nll_agg = nig_nll_loss(mu_final, v_final, alpha_final, beta_final, labels)
+            loss += nll_agg
             
         elif model_type == 'NIG':
             # Single NIG
@@ -362,21 +367,6 @@ def main():
     # Set seed
     set_seed(args.seed)
     
-    # Load CASF 2016 PDB IDs from ground truth file
-    casf2016_pdb_ids = None
-    casf2016_file = 'data/coreset_dirs.csv'
-    if os.path.isfile(casf2016_file):
-        # Read from file (one PDB ID per line, skip header if present)
-        with open(casf2016_file, 'r') as f:
-            lines = [line.strip() for line in f if line.strip()]
-            # Skip header if it looks like a header (contains "directory" or similar)
-            if len(lines) > 0 and ('directory' in lines[0].lower() or 'pdb' in lines[0].lower()):
-                lines = lines[1:]
-            casf2016_pdb_ids = lines
-        print(f"Loaded {len(casf2016_pdb_ids)} CASF 2016 PDB IDs from {casf2016_file}")
-    else:
-        print(f"Warning: CASF 2016 file not found at {casf2016_file}, proceeding without exclusion")
-    
     print("="*50)
     print("Drug Discovery with MoNIG (Embeddings)")
     print("="*50)
@@ -384,24 +374,21 @@ def main():
     print(f"Expert Config: {expert_config}")
     print(f"Device: {args.device}")
     print(f"CSV: {args.csv_path}")
-    if casf2016_pdb_ids:
-        print(f"CASF 2016 excluded: {len(casf2016_pdb_ids)} complexes")
+    print(f"Test set: data/test.csv")
     print("="*50)
     
     # Load datasets
     print("\nLoading datasets...")
     train_dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split='train', seed=args.seed, casf2016_pdb_ids=casf2016_pdb_ids)
+        args.csv_path, split='train', seed=args.seed)
     norm_stats = {
         'mean': train_dataset.emb_mean,
         'std': train_dataset.emb_std
     }
     valid_dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split='valid', seed=args.seed, normalization_stats=norm_stats,
-        casf2016_pdb_ids=casf2016_pdb_ids)
+        args.csv_path, split='valid', seed=args.seed, normalization_stats=norm_stats)
     test_dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split='test', seed=args.seed, normalization_stats=norm_stats,
-        casf2016_pdb_ids=casf2016_pdb_ids)
+        args.csv_path, split='test', seed=args.seed, normalization_stats=norm_stats)
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)

@@ -48,6 +48,12 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
         self.evidential_heads = nn.ModuleList([
             self._build_evidential_head() for _ in range(self.num_experts)
         ])
+
+        self.gating_net = nn.Sequential(
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.num_experts)
+        )
     
     def _build_evidential_head(self):
         """
@@ -95,9 +101,16 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
         # Process each expert
         nigs = []
         for i in range(self.num_experts):
-            # Step 1: Calibrate expert score
+            # Step 1: Bounded residual calibration
             expert_i = expert_scores[:, i:i+1]  # [batch, 1]
-            calibrated = self.calibrators[i](expert_i)  # [batch, 1]
+
+            # Calibrator predicts a small residual in [-1, 1]
+            delta = self.calibrators[i](expert_i)
+            delta = torch.tanh(delta)          # [-1, 1]
+
+            # Limit how much the calibrator can change the raw score
+            # 0.1 is a small scaling factor; you can tune it (e.g., 0.05–0.2)
+            calibrated = expert_i + 0.1 * delta   # [batch, 1]
             
             # Step 2: Fuse calibrated score with embedding context
             head = self.evidential_heads[i]

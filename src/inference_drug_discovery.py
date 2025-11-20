@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 from scipy import stats
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
 import uncertainty_toolbox as uct
 
@@ -80,8 +81,10 @@ def inference_monig(model, loader, device, iso_model=None):
         - MoNIG_Prediction (aggregated)
         - Expert1_Epistemic, Expert2_Epistemic, Expert3_Epistemic
         - Expert1_Aleatoric, Expert2_Aleatoric, Expert3_Aleatoric
-        - MoNIG_Epistemic
-        - MoNIG_Aleatoric
+        - MoNIG_Epistemic       (raw from NIG)
+        - MoNIG_Aleatoric       (raw from NIG)
+        - MoNIG_TotalStd_Raw    (sqrt(ep+al))
+        - MoNIG_TotalStd_Calibrated (after isotonic, if calibrator is available)
     """
     model.eval()
     results = []
@@ -99,6 +102,14 @@ def inference_monig(model, loader, device, iso_model=None):
             
             # Aggregate
             mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
+            # ----- Softmax expert gating (replaces ν-based weighting) -----
+            gating_weights = None
+            if hasattr(model, 'embedding_encoder') and hasattr(model, 'gating_net'):
+                # Recompute the same embedding context used inside the model
+                emb_encoded = model.embedding_encoder(embeddings)          # [batch, 64]
+                gating_logits = model.gating_net(emb_encoded)              # [batch, num_experts]
+                gating_weights = F.softmax(gating_logits, dim=-1)          # [batch, num_experts]
+            # ----------------------------------------------------------------
             
             # Extract all experts to numpy
             expert_data = []
@@ -116,42 +127,46 @@ def inference_monig(model, loader, device, iso_model=None):
             alpha_agg = alpha_final.cpu().numpy()
             beta_agg = beta_final.cpu().numpy()
             
-            epistemic_agg = beta_agg / (v_agg * (alpha_agg - 1))
-            aleatoric_agg = beta_agg / (alpha_agg - 1)
-            total_std = np.sqrt(epistemic_agg + aleatoric_agg)
-            calibrated_std = apply_interval_calibration(
-                mu_agg, total_std, iso_model
+            # --- Correct uncertainty handling ---
+            # Raw epistemic / aleatoric from NIG (DO NOT RESCALE THESE)
+            epistemic_agg = beta_agg / (v_agg * (alpha_agg - 1.0))
+            aleatoric_agg = beta_agg / (alpha_agg - 1.0)
+            total_std_raw = np.sqrt(epistemic_agg + aleatoric_agg)
+
+            # Apply isotonic / interval calibration ONLY to total std
+            total_std_calibrated = apply_interval_calibration(
+                mu_agg, total_std_raw, iso_model
             )
-            total_var = total_std ** 2
-            calibrated_var = calibrated_std ** 2
-            scale = np.ones_like(calibrated_var)
-            valid_mask = total_var > 0
-            scale[valid_mask] = calibrated_var[valid_mask] / total_var[valid_mask]
-            scale = np.clip(scale, 1e-4, None)
-            epistemic_agg = epistemic_agg * scale
-            aleatoric_agg = aleatoric_agg * scale
+            # ------------------------------------
             
             # Process each sample in batch
             for i in range(len(labels)):
                 # Compute weights (how much each expert contributes)
-                total_v = sum(expert_data[j]['v'][i, 0] for j in range(num_experts))
-                weights = [expert_data[j]['v'][i, 0] / total_v for j in range(num_experts)]
+                # Prefer learned softmax gating; fall back to ν-based if unavailable
+                if gating_weights is not None:
+                    weights = gating_weights[i].detach().cpu().numpy().tolist()
+                else:
+                    total_v = sum(expert_data[j]['v'][i, 0] for j in range(num_experts))
+                    weights = [expert_data[j]['v'][i, 0] / total_v for j in range(num_experts)]
                 
-                # Compute uncertainties for each expert
+                # Compute uncertainties for each expert (raw NIG)
                 expert_uncertainties = []
                 for j in range(num_experts):
                     v_j = expert_data[j]['v'][i, 0]
                     alpha_j = expert_data[j]['alpha'][i, 0]
                     beta_j = expert_data[j]['beta'][i, 0]
-                    epistemic_j = beta_j / (v_j * (alpha_j - 1))
-                    aleatoric_j = beta_j / (alpha_j - 1)
+                    epistemic_j = beta_j / (v_j * (alpha_j - 1.0))
+                    aleatoric_j = beta_j / (alpha_j - 1.0)
                     expert_uncertainties.append({
                         'epistemic': epistemic_j,
                         'aleatoric': aleatoric_j
                     })
                 
+                # Raw MoNIG uncertainties for this sample
                 epistemic_val = epistemic_agg[i, 0]
                 aleatoric_val = aleatoric_agg[i, 0]
+                total_std_raw_i = total_std_raw[i, 0]
+                total_std_cal_i = total_std_calibrated[i, 0]
                 
                 # Build result dictionary
                 result = {
@@ -168,10 +183,12 @@ def inference_monig(model, loader, device, iso_model=None):
                     result[f'Expert{expert_num}_Epistemic'] = expert_uncertainties[j]['epistemic']
                     result[f'Expert{expert_num}_Aleatoric'] = expert_uncertainties[j]['aleatoric']
                 
-                # MoNIG aggregated
+                # MoNIG aggregated (raw evidential uncertainties + calibrated total std)
                 result['MoNIG_Prediction'] = mu_agg[i, 0]
                 result['MoNIG_Epistemic'] = epistemic_val
                 result['MoNIG_Aleatoric'] = aleatoric_val
+                result['MoNIG_TotalStd_Raw'] = total_std_raw_i
+                result['MoNIG_TotalStd_Calibrated'] = total_std_cal_i
                 
                 # Analysis: find most confident expert
                 confidences = [expert_data[j]['v'][i, 0] for j in range(num_experts)]
@@ -182,9 +199,11 @@ def inference_monig(model, loader, device, iso_model=None):
                 # Expert disagreement: max pairwise difference
                 predictions = [expert_data[j]['mu'][i, 0] for j in range(num_experts)]
                 if num_experts >= 2:
-                    max_disagreement = max(abs(predictions[idx1] - predictions[idx2]) 
-                                          for idx1 in range(num_experts) 
-                                          for idx2 in range(idx1+1, num_experts))
+                    max_disagreement = max(
+                        abs(predictions[idx1] - predictions[idx2]) 
+                        for idx1 in range(num_experts) 
+                        for idx2 in range(idx1 + 1, num_experts)
+                    )
                     result['Expert_Disagreement'] = max_disagreement
                 else:
                     result['Expert_Disagreement'] = 0.0
@@ -212,8 +231,8 @@ def main():
     
     # Data split
     parser.add_argument('--split', type=str, default='test',
-                       choices=['train', 'valid', 'test', 'casf2016'],
-                       help='Which split to run inference on (test=internal test set, casf2016=CASF 2016 benchmark)')
+                       choices=['train', 'valid', 'test'],
+                       help='Which split to run inference on (test set uses IDs from data/test.csv)')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size')
     
@@ -237,21 +256,6 @@ def main():
     # Set seed for reproducibility
     set_seed(0)
     
-    # Load CASF 2016 PDB IDs from ground truth file
-    casf2016_pdb_ids = None
-    casf2016_file = 'data/coreset_dirs.csv'
-    if os.path.isfile(casf2016_file):
-        # Read from file (one PDB ID per line, skip header if present)
-        with open(casf2016_file, 'r') as f:
-            lines = [line.strip() for line in f if line.strip()]
-            # Skip header if it looks like a header (contains "directory" or similar)
-            if len(lines) > 0 and ('directory' in lines[0].lower() or 'pdb' in lines[0].lower()):
-                lines = lines[1:]
-            casf2016_pdb_ids = lines
-        print(f"Loaded {len(casf2016_pdb_ids)} CASF 2016 PDB IDs from {casf2016_file}")
-    else:
-        print(f"Warning: CASF 2016 file not found at {casf2016_file}, proceeding without exclusion")
-    
     print("="*70)
     print("MoNIG Inference - Expert Analysis")
     print("="*70)
@@ -261,8 +265,6 @@ def main():
     print(f"Split: {args.split}")
     print(f"Output: {args.output_path}")
     print(f"Device: {args.device}")
-    if casf2016_pdb_ids:
-        print(f"CASF 2016 excluded: {len(casf2016_pdb_ids)} complexes")
     print("="*70)
     # Load normalization stats
     if args.norm_stats_path is not None:
@@ -293,8 +295,7 @@ def main():
     # Load dataset
     print(f"\nLoading {args.split} dataset...")
     dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split=args.split, normalization_stats=norm_stats,
-        casf2016_pdb_ids=casf2016_pdb_ids)
+        args.csv_path, split=args.split, normalization_stats=norm_stats)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     
     # Get dimensions
@@ -364,6 +365,9 @@ def main():
     print(f"\nUncertainty:")
     print(f"  Avg epistemic (MoNIG): {df_results['MoNIG_Epistemic'].mean():.4f}")
     print(f"  Avg aleatoric (MoNIG): {df_results['MoNIG_Aleatoric'].mean():.4f}")
+    print(f"  Avg total std (raw):   {df_results['MoNIG_TotalStd_Raw'].mean():.4f}")
+    if 'MoNIG_TotalStd_Calibrated' in df_results.columns:
+        print(f"  Avg total std (cal.): {df_results['MoNIG_TotalStd_Calibrated'].mean():.4f}")
     
     # Highlight interesting cases
     print(f"\nInteresting Cases:")
@@ -384,4 +388,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
