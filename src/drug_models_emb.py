@@ -1,16 +1,19 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
 
 
 class DrugDiscoveryMoNIGEmb(nn.Module):
     """
-    Drug Discovery model using Mixture of Normal-Inverse Gamma (MoNIG) with embeddings
+    Drug Discovery model using Mixture of Normal-Inverse Gamma (MoNIG) with reliability network
     
     Architecture:
-    - Input: Expert Scores + Molecular Embeddings (704-dim)
-    - Per-expert: Calibrator → Context-Aware Evidential Head → NIG parameters
-    - MoNIG Aggregator: Combine all expert NIGs
+    - Expert Scores → Engine Score MLP → Per-expert NIG params (μ_j, α_j, β_j, v_j)
+    - 703D Embeddings → Reliability Net (MLP) → r_j ∈ (0,1) per engine
+    - Scale α_j, β_j, v_j with r_j
+    - MoNIG Expert Fusion → Final Aggregated NIG
     """
     def __init__(self, hyp_params):
         super(DrugDiscoveryMoNIGEmb, self).__init__()
@@ -20,18 +23,7 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
         self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
         self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
         
-        # Embedding encoder (reduce dimension from 704 to manageable size)
-        self.embedding_encoder = nn.Sequential(
-            nn.Linear(self.embedding_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-        )
-        
+        # Engine Score MLP: Expert scores → NIG parameters
         # Per-expert calibrators (adjust expert scores)
         self.calibrators = nn.ModuleList([
             nn.Sequential(
@@ -44,20 +36,35 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
             ) for _ in range(self.num_experts)
         ])
         
-        # Per-expert evidential heads
+        # Per-expert evidential heads (produce NIG params from calibrated scores)
         self.evidential_heads = nn.ModuleList([
             self._build_evidential_head() for _ in range(self.num_experts)
         ])
+        
+        # Reliability Net: Embeddings → reliability scores r_j ∈ (0,1) per engine
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.embedding_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(128, self.num_experts),  # Output one reliability score per expert
+            nn.Sigmoid()  # Ensure r_j ∈ (0,1)
+        )
     
     def _build_evidential_head(self):
         """
-        Context-aware evidential head that produces NIG parameters
-        Input: embedding context (64) + calibrated expert score (1)
+        Evidential head that produces NIG parameters from calibrated expert score
+        Input: calibrated expert score (1)
         Output: μ, ν, α, β (NIG parameters)
         """
         return nn.ModuleDict({
             'fusion': nn.Sequential(
-                nn.Linear(64 + 1, self.hidden_dim),  # Embedding context (64) + Score (1)
+                nn.Linear(1, self.hidden_dim),  # Calibrated score (1)
                 nn.ReLU(),
                 nn.Dropout(self.dropout),
                 nn.Linear(self.hidden_dim, 128),
@@ -82,41 +89,53 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
         
         Args:
             expert_scores: [batch, num_experts] - Pre-computed expert predictions
-            embeddings: [batch, embedding_dim] - Molecular/protein embeddings
+            embeddings: [batch, embedding_dim] - 703D protein/ligand embeddings
         
         Returns:
-            List of (mu, v, alpha, beta) tuples, one per expert
+            List of (mu, v, alpha, beta) tuples, one per expert (after reliability scaling)
         """
-        batch_size = expert_scores.shape[0]
-        
-        # Encode embeddings to lower dimension
-        emb_encoded = self.embedding_encoder(embeddings)  # [batch, 64]
-        
-        # Process each expert
+        # Step 1: Engine Score MLP → Per-expert NIG params
         nigs = []
         for i in range(self.num_experts):
-            # Step 1: Calibrate expert score
+            # Calibrate expert score
             expert_i = expert_scores[:, i:i+1]  # [batch, 1]
             calibrated = self.calibrators[i](expert_i)  # [batch, 1]
             
-            # Step 2: Fuse calibrated score with embedding context
+            # Process through evidential head
             head = self.evidential_heads[i]
-            fused = head['fusion'](torch.cat([emb_encoded, calibrated], dim=1))  # [batch, 64]
+            fused = head['fusion'](calibrated)  # [batch, 64]
             
-            # Step 3: Predict NIG parameters
+            # Predict NIG parameters
             mu = head['mu_head'](fused)          # [batch, 1]
             logv = head['v_head'](fused)         # [batch, 1]
             logalpha = head['alpha_head'](fused) # [batch, 1]
             logbeta = head['beta_head'](fused)   # [batch, 1]
             
-            # Step 4: Apply evidence function to ensure proper parameter ranges
+            # Apply evidence function to ensure proper parameter ranges
             v = self.evidence(logv)              # ν > 0
             alpha = self.evidence(logalpha) + 1  # α > 1
             beta = self.evidence(logbeta)        # β > 0
             
             nigs.append((mu, v, alpha, beta))
         
-        return nigs
+        # Step 2: Reliability Net → reliability scores r_j ∈ (0,1) per engine
+        reliability_scores = self.reliability_net(embeddings)  # [batch, num_experts]
+        
+        # Step 3: Scale α_j, β_j, v_j with r_j (μ_j is NOT scaled)
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]  # [batch, 1] reliability for expert i
+            
+            # Scale v, alpha, beta with reliability (but keep mu unchanged)
+            # For alpha: ensure α > 1 after scaling by scaling the excess above 1
+            v_scaled = v * r_j
+            alpha_scaled = 1.0 + (alpha - 1.0) * r_j + 1e-6  # Ensure α > 1
+            beta_scaled = beta * r_j
+            
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
 
 
 class DrugDiscoveryNIGEmb(nn.Module):
@@ -268,3 +287,222 @@ class DrugDiscoveryBaselineEmb(nn.Module):
     def forward(self, expert_scores, embeddings):
         x = torch.cat([expert_scores, embeddings], dim=1)
         return self.model(x)
+
+
+class DrugDiscoveryDeepEnsemble(nn.Module):
+    """
+    Deep Ensemble: Ensemble of multiple baseline models for uncertainty estimation
+    """
+    def __init__(self, hyp_params):
+        super(DrugDiscoveryDeepEnsemble, self).__init__()
+        
+        self.num_models = hyp_params.num_models if hasattr(hyp_params, 'num_models') else 5
+        self.expert_dim = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        
+        # Create ensemble of models
+        self.models = nn.ModuleList([
+            DrugDiscoveryBaselineEmb(hyp_params) for _ in range(self.num_models)
+        ])
+    
+    def forward(self, expert_scores, embeddings):
+        """
+        Forward pass: average predictions from all models
+        
+        Returns:
+            mean: averaged prediction [batch, 1]
+            std: standard deviation across models [batch, 1]
+        """
+        predictions = []
+        for model in self.models:
+            pred = model(expert_scores, embeddings)  # [batch, 1]
+            predictions.append(pred)
+        
+        # Stack and compute statistics
+        pred_stack = torch.stack(predictions, dim=0)  # [num_models, batch, 1]
+        mean = pred_stack.mean(dim=0)  # [batch, 1]
+        std = pred_stack.std(dim=0)  # [batch, 1]
+        
+        return mean, std
+
+
+class DrugDiscoveryMCDropout(nn.Module):
+    """
+    Monte Carlo Dropout: Uses dropout at inference time for uncertainty estimation
+    """
+    def __init__(self, hyp_params):
+        super(DrugDiscoveryMCDropout, self).__init__()
+        
+        self.expert_dim = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        self.num_samples = hyp_params.num_mc_samples if hasattr(hyp_params, 'num_mc_samples') else 50
+        
+        # Use same architecture as Baseline but with dropout enabled at inference
+        self.model = nn.Sequential(
+            nn.Linear(self.expert_dim + self.embedding_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, 1)
+        )
+    
+    def forward(self, expert_scores, embeddings, num_samples=None):
+        """
+        Forward pass with Monte Carlo sampling
+        
+        Args:
+            expert_scores: [batch, num_experts]
+            embeddings: [batch, embedding_dim]
+            num_samples: Number of MC samples (default: self.num_samples)
+        
+        Returns:
+            mean: mean prediction [batch, 1]
+            std: standard deviation [batch, 1]
+        """
+        if num_samples is None:
+            num_samples = self.num_samples
+        
+        # Enable dropout for MC sampling
+        self.train()
+        
+        x = torch.cat([expert_scores, embeddings], dim=1)
+        predictions = []
+        
+        for _ in range(num_samples):
+            pred = self.model(x)  # [batch, 1]
+            predictions.append(pred)
+        
+        # Stack and compute statistics
+        pred_stack = torch.stack(predictions, dim=0)  # [num_samples, batch, 1]
+        mean = pred_stack.mean(dim=0)  # [batch, 1]
+        std = pred_stack.std(dim=0)  # [batch, 1]
+        
+        return mean, std
+
+
+class DrugDiscoveryRandomForest:
+    """
+    Random Forest Regressor wrapper for compatibility with training/inference pipeline
+    Note: This is not a PyTorch module, but a sklearn wrapper
+    """
+    def __init__(self, hyp_params):
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.n_estimators = hyp_params.n_estimators if hasattr(hyp_params, 'n_estimators') else 100
+        self.max_depth = hyp_params.max_depth if hasattr(hyp_params, 'max_depth') else None
+        self.min_samples_split = hyp_params.min_samples_split if hasattr(hyp_params, 'min_samples_split') else 2
+        self.min_samples_leaf = hyp_params.min_samples_leaf if hasattr(hyp_params, 'min_samples_leaf') else 1
+        
+        self.model = RandomForestRegressor(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            min_samples_split=self.min_samples_split,
+            min_samples_leaf=self.min_samples_leaf,
+            n_jobs=-1,
+            random_state=42
+        )
+        self.is_trained = False
+    
+    def to(self, device):
+        """Compatibility method - RF doesn't use GPU"""
+        return self
+    
+    def train(self):
+        """Compatibility method"""
+        return self
+    
+    def eval(self):
+        """Compatibility method"""
+        return self
+    
+    def parameters(self):
+        """Compatibility method - return empty iterator"""
+        return iter([])
+    
+    def state_dict(self):
+        """Return model state for saving"""
+        return {
+            'model': self.model,
+            'is_trained': self.is_trained
+        }
+    
+    def load_state_dict(self, state_dict):
+        """Load model state"""
+        self.model = state_dict['model']
+        self.is_trained = state_dict.get('is_trained', False)
+    
+    def fit(self, X, y):
+        """Train the random forest"""
+        self.model.fit(X, y)
+        self.is_trained = True
+    
+    def predict(self, X, return_std=True):
+        """
+        Predict with uncertainty estimation
+        
+        Args:
+            X: Input features [n_samples, n_features]
+            return_std: Whether to return standard deviation
+        
+        Returns:
+            mean: Mean prediction [n_samples]
+            std: Standard deviation [n_samples] (if return_std=True)
+        """
+        if not self.is_trained:
+            raise ValueError("Model must be trained before prediction")
+        
+        # Get predictions from all trees
+        predictions = np.array([tree.predict(X) for tree in self.model.estimators_])
+        
+        # Compute mean and std across trees
+        mean = predictions.mean(axis=0)
+        
+        if return_std:
+            std = predictions.std(axis=0)
+            return mean, std
+        else:
+            return mean
+    
+    def forward(self, expert_scores, embeddings):
+        """
+        Forward pass compatible with PyTorch interface
+        
+        Args:
+            expert_scores: torch.Tensor [batch, num_experts]
+            embeddings: torch.Tensor [batch, embedding_dim]
+        
+        Returns:
+            mean: torch.Tensor [batch, 1]
+            std: torch.Tensor [batch, 1]
+        """
+        # Convert to numpy
+        expert_scores_np = expert_scores.detach().cpu().numpy()
+        embeddings_np = embeddings.detach().cpu().numpy()
+        
+        # Concatenate features
+        X = np.concatenate([expert_scores_np, embeddings_np], axis=1)
+        
+        # Predict
+        mean, std = self.predict(X, return_std=True)
+        
+        # Convert back to torch tensors
+        mean_tensor = torch.from_numpy(mean).float().unsqueeze(1)
+        std_tensor = torch.from_numpy(std).float().unsqueeze(1)
+        
+        return mean_tensor, std_tensor
+    
+    def __call__(self, expert_scores, embeddings):
+        """Make the object callable like a PyTorch module"""
+        return self.forward(expert_scores, embeddings)

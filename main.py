@@ -45,12 +45,20 @@ Examples:
     
     # Model
     train_parser.add_argument('--model_type', type=str, default='MoNIG',
-                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline'],
+                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest'],
                              help='Model type')
     train_parser.add_argument('--hidden_dim', type=int, default=256,
                              help='Hidden dimension')
     train_parser.add_argument('--dropout', type=float, default=0.2,
                              help='Dropout rate')
+    train_parser.add_argument('--num_models', type=int, default=5,
+                             help='Number of models in ensemble (for DeepEnsemble)')
+    train_parser.add_argument('--num_mc_samples', type=int, default=50,
+                             help='Number of MC samples for MCDropout')
+    train_parser.add_argument('--n_estimators', type=int, default=100,
+                             help='Number of trees for RandomForest')
+    train_parser.add_argument('--max_depth', type=int, default=20,
+                             help='Max depth for RandomForest (default: 20)')
     
     # Expert selection
     train_parser.add_argument('--expert1_only', action='store_true',
@@ -88,8 +96,6 @@ Examples:
                              help='Path to save output CSV')
     infer_parser.add_argument('--norm_stats_path', type=str, default=None,
                              help='Path to normalization stats (.npz). Auto-detected if not provided')
-    infer_parser.add_argument('--calibrator_path', type=str, default=None,
-                             help='Path to isotonic calibrator (.pkl). Auto-detected if not provided')
     
     # Data split
     infer_parser.add_argument('--split', type=str, default='test',
@@ -103,6 +109,18 @@ Examples:
                              help='Hidden dimension (must match training)')
     infer_parser.add_argument('--dropout', type=float, default=0.2,
                              help='Dropout rate (must match training)')
+    infer_parser.add_argument('--num_models', type=int, default=5,
+                             help='Number of models in ensemble (for DeepEnsemble)')
+    infer_parser.add_argument('--num_mc_samples', type=int, default=50,
+                             help='Number of MC samples for MCDropout')
+    infer_parser.add_argument('--n_estimators', type=int, default=100,
+                             help='Number of trees for RandomForest')
+    infer_parser.add_argument('--max_depth', type=int, default=20,
+                             help='Max depth for RandomForest (default: 20)')
+    
+    # Reproducibility
+    infer_parser.add_argument('--seed', type=int, default=42,
+                             help='Random seed for reproducibility')
     
     # Device
     infer_parser.add_argument('--device', type=str, 
@@ -128,12 +146,17 @@ Examples:
             '--model_type', args.model_type,
             '--hidden_dim', str(args.hidden_dim),
             '--dropout', str(args.dropout),
+            '--num_models', str(getattr(args, 'num_models', 5)),
+            '--num_mc_samples', str(getattr(args, 'num_mc_samples', 50)),
+            '--n_estimators', str(getattr(args, 'n_estimators', 100)),
             '--epochs', str(args.epochs),
             '--lr', str(args.lr),
             '--risk_weight', str(args.risk_weight),
             '--seed', str(args.seed),
             '--device', args.device,
         ]
+        # Add max_depth (has default value of 20)
+        train_args.extend(['--max_depth', str(args.max_depth)])
         if args.expert1_only:
             train_args.append('--expert1_only')
         if args.expert2_only:
@@ -160,12 +183,15 @@ Examples:
             '--batch_size', str(args.batch_size),
             '--hidden_dim', str(args.hidden_dim),
             '--dropout', str(args.dropout),
+            '--num_models', str(getattr(args, 'num_models', 5)),
+            '--num_mc_samples', str(getattr(args, 'num_mc_samples', 50)),
+            '--n_estimators', str(getattr(args, 'n_estimators', 100)),
+            '--max_depth', str(getattr(args, 'max_depth', 20)),
+            '--seed', str(getattr(args, 'seed', 42)),
             '--device', args.device,
         ]
         if args.norm_stats_path:
             infer_args.extend(['--norm_stats_path', args.norm_stats_path])
-        if args.calibrator_path:
-            infer_args.extend(['--calibrator_path', args.calibrator_path])
         
         # Temporarily replace sys.argv and call inference_main
         old_argv = sys.argv

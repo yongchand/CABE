@@ -6,7 +6,9 @@ Probabilistic binding-affinity prediction pipeline that combines multiple dockin
 
 This repository implements a drug discovery pipeline using MoNIG (Mixture of Normal-Inverse Gamma distributions) for trustworthy uncertainty quantification in binding affinity prediction. The system:
 
-- Combines multiple expert predictions (e.g., GNINA, BIND) with molecular embeddings
+- Processes expert predictions (e.g., GNINA, BIND, Flowdock) through an Engine Score MLP to produce per-expert NIG parameters
+- Uses a Reliability Network that processes molecular embeddings to compute expert-specific reliability scores
+- Scales uncertainty parameters (α, β, v) based on reliability while preserving mean predictions
 - Produces calibrated epistemic and aleatoric uncertainty estimates
 - Uses isotonic recalibration for improved uncertainty calibration
 - Supports ablation studies with single-expert configurations
@@ -164,32 +166,48 @@ ComplexID,Binding_Affinity,GNINA_Affinity,BIND_pIC50,Emb_0,Emb_1,...,Emb_703
 
 ## Model Architecture
 
-The MoNIG architecture combines expert predictions with molecular embeddings:
+The MoNIG architecture uses expert predictions and molecular embeddings with a reliability network:
 
 ```
-Expert i                                Molecular embeddings (704-dim)
-────────┐                                ┌──────────────────────────────┐
-        │                                │  Linear → ReLU → Dropout     │
-Raw score (Eᵢ) -- Calibratorᵢ --┐       │  Linear → ReLU → Dropout     │
-                                 ├─Concat┴──────────────────────────────┘
-                                 │
-                 Context-aware Evidential Headᵢ
-                 ├─ fusion MLP (hidden_dim)
-                 ├─ μ head → μᵢ (mean)
-                 ├─ ν head → νᵢ (precision, softplus)
-                 ├─ α head → αᵢ (shape, softplus + 1)
-                 └─ β head → βᵢ (scale, softplus)
-
-MoNIG Aggregator (Equation 9)
-NIG₁ ⊕ NIG₂ ⊕ … ⊕ NIG_k → Combined NIG(μ, ν, α, β)
+          GNINA score
+               │
+          BIND score
+               │
+       Flowdock score
+               │
+               ▼
+      Engine score MLP
+      (Calibrator → Evidential Head)
+               │
+               ▼
+    Per-expert NIG params
+       μ_j, α_j, β_j, v_j
+               │
+               ├───────────────────────┐
+               ▼                       │
+      MoNIG Expert Fusion              │
+                                       │
+703D protein/ligand embedding          │
+               │                       │
+               ▼                       │
+     Reliability Net (MLP)─────────────┘
+     Outputs r_j ∈ (0,1) per engine
+               │
+               ▼
+   Scale α_j, β_j, v_j with r_j
+   (μ_j is NOT scaled)
+               │
+               ▼
+       Final Aggregated NIG
+     (mean, aleatoric, epistemic)
 ```
 
 **Key Components:**
 
-1. **Per-Expert Calibrators**: Adjust raw expert scores
-2. **Embedding Encoder**: Reduces 704-dim embeddings to 64-dim context
-3. **Evidential Heads**: Each expert gets its own NIG parameter predictor
-4. **MoNIG Aggregator**: Combines multiple NIG distributions using closed-form formulas
+1. **Engine Score MLP**: Per-expert calibrators and evidential heads that convert raw expert scores to NIG parameters (μ_j, α_j, β_j, v_j)
+2. **Reliability Network**: MLP that processes 703D protein/ligand embeddings to produce reliability scores r_j ∈ (0,1) for each expert
+3. **Reliability Scaling**: Scales uncertainty parameters (α_j, β_j, v_j) with reliability scores, while keeping mean predictions (μ_j) unchanged
+4. **MoNIG Aggregator**: Combines multiple reliability-scaled NIG distributions using closed-form formulas (Equation 9)
 
 **Uncertainty Decomposition:**
 - **Epistemic uncertainty** = β / (ν × (α - 1)) - model uncertainty

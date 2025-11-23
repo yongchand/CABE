@@ -237,7 +237,100 @@ def analyze_uncertainty(csv_path):
     print(f"  Avg MoNIG Epistemic:  {high_disagreement['MoNIG_Epistemic'].mean():.4f}")
     print(f"  Avg MoNIG Error:      {high_disagreement['MoNIG_Error'].mean():.4f}")
     
-    # ===== 7. Practical Recommendations =====
+    # ===== 7. MoNIG Identifies When NOT to Trust Engines =====
+    print("\n\n🚨 MoNIG IDENTIFIES WHEN NOT TO TRUST ENGINES")
+    print("-" * 80)
+    print("\nThis section demonstrates that MoNIG correctly identifies low confidence")
+    print("when individual engines are wrong and have high epistemic uncertainty.")
+    
+    expert_names = ['GNINA', 'BIND', 'flowdock']
+    
+    # Define thresholds: "wrong" = error > median error, "high epistemic" = > 75th percentile
+    error_thresholds = {}
+    epistemic_thresholds = {}
+    
+    for j in range(num_experts):
+        expert_num = j + 1
+        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+        
+        # Threshold: expert is "wrong" if error > median error
+        error_thresholds[j] = df[f'Expert{expert_num}_Error'].median()
+        # Threshold: expert has "high epistemic" if > 75th percentile
+        epistemic_thresholds[j] = df[f'Expert{expert_num}_Epistemic'].quantile(0.75)
+    
+    # MoNIG high epistemic threshold
+    monig_high_epistemic_thresh = df['MoNIG_Epistemic'].quantile(0.75)
+    
+    print(f"\n📊 Thresholds:")
+    for j in range(num_experts):
+        expert_num = j + 1
+        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+        print(f"  {expert_name}: Error > {error_thresholds[j]:.4f}, Epistemic > {epistemic_thresholds[j]:.4f}")
+    print(f"  MoNIG: Epistemic > {monig_high_epistemic_thresh:.4f}")
+    
+    # Find cases for each expert
+    untrustworthy_cases = {}
+    
+    for j in range(num_experts):
+        expert_num = j + 1
+        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+        
+        # Find cases where expert is wrong AND has high epistemic uncertainty
+        wrong_mask = df[f'Expert{expert_num}_Error'] > error_thresholds[j]
+        high_epistemic_mask = df[f'Expert{expert_num}_Epistemic'] > epistemic_thresholds[j]
+        untrustworthy = df[wrong_mask & high_epistemic_mask].copy()
+        
+        untrustworthy_cases[j] = untrustworthy
+        
+        print(f"\n🔴 {expert_name} Untrustworthy Cases (Wrong + High Epistemic):")
+        print(f"   Found {len(untrustworthy)} cases")
+        
+        if len(untrustworthy) > 0:
+            # Check if MoNIG also has high epistemic in these cases
+            monig_also_uncertain = untrustworthy[untrustworthy['MoNIG_Epistemic'] > monig_high_epistemic_thresh]
+            print(f"   ✅ MoNIG also uncertain in {len(monig_also_uncertain)}/{len(untrustworthy)} cases ({len(monig_also_uncertain)/len(untrustworthy)*100:.1f}%)")
+            
+            # Show top 5 clearest examples
+            if len(untrustworthy) > 0:
+                # Sort by error (most wrong) and epistemic (highest uncertainty)
+                untrustworthy_sorted = untrustworthy.sort_values(
+                    by=[f'Expert{expert_num}_Error', f'Expert{expert_num}_Epistemic'], 
+                    ascending=False
+                ).head(5)
+                
+                print(f"\n   Top 5 clearest examples:")
+                display_cols = ['ComplexID', 'True_Affinity', 
+                               f'Expert{expert_num}_Prediction', f'Expert{expert_num}_Error',
+                               f'Expert{expert_num}_Epistemic', 
+                               'MoNIG_Prediction', 'MoNIG_Epistemic']
+                print(untrustworthy_sorted[display_cols].to_string(index=False))
+        else:
+            print(f"   ⚠️  No cases found matching criteria")
+    
+    # Summary: How often does MoNIG correctly identify untrustworthy experts?
+    print(f"\n\n📈 SUMMARY: MoNIG's Ability to Identify Untrustworthy Engines")
+    print("-" * 80)
+    
+    all_untrustworthy = set()
+    for j in range(num_experts):
+        if len(untrustworthy_cases[j]) > 0:
+            all_untrustworthy.update(untrustworthy_cases[j].index)
+    
+    if len(all_untrustworthy) > 0:
+        all_untrustworthy_df = df.loc[list(all_untrustworthy)]
+        monig_correctly_uncertain = all_untrustworthy_df[
+            all_untrustworthy_df['MoNIG_Epistemic'] > monig_high_epistemic_thresh
+        ]
+        
+        print(f"Total cases where ANY expert is untrustworthy: {len(all_untrustworthy)}")
+        print(f"MoNIG correctly uncertain (high epistemic) in: {len(monig_correctly_uncertain)} cases")
+        print(f"Success rate: {len(monig_correctly_uncertain)/len(all_untrustworthy)*100:.1f}%")
+        print(f"\n✅ This demonstrates that MoNIG correctly identifies when NOT to trust engines!")
+        print(f"   When individual engines are wrong and uncertain, MoNIG also shows high epistemic uncertainty.")
+    else:
+        print("⚠️  No untrustworthy cases found in this dataset.")
+    
+    # ===== 8. Practical Recommendations =====
     print("\n\n💡 PRACTICAL RECOMMENDATIONS")
     print("-" * 80)
     
@@ -550,6 +643,168 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
     print(f"  ✓ Saved: {diag_path}")
     plt.close(fig_diag)
     
+    # ===== 4. Visualization: "When NOT to Trust Engines" =====
+    print("\n📊 Generating 'When NOT to Trust Engines' visualization...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig.suptitle('MoNIG Identifies When NOT to Trust Engines', fontsize=16, fontweight='bold')
+    
+    expert_names = ['GNINA', 'BIND', 'flowdock']
+    colors_expert = ['coral', 'skyblue', 'lightgreen']
+    
+    # Calculate thresholds
+    error_thresholds = {}
+    epistemic_thresholds = {}
+    for j in range(num_experts):
+        expert_num = j + 1
+        error_thresholds[j] = df[f'Expert{expert_num}_Error'].median()
+        epistemic_thresholds[j] = df[f'Expert{expert_num}_Epistemic'].quantile(0.75)
+    monig_high_epistemic_thresh = df['MoNIG_Epistemic'].quantile(0.75)
+    
+    # Plot 1: Expert Error vs Epistemic (highlight untrustworthy cases)
+    ax1 = axes[0, 0]
+    for j in range(num_experts):
+        expert_num = j + 1
+        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+        
+        # All points
+        ax1.scatter(df[f'Expert{expert_num}_Epistemic'], df[f'Expert{expert_num}_Error'],
+                   alpha=0.3, s=15, color=colors_expert[j], label=f'{expert_name} (all)')
+        
+        # Untrustworthy cases (wrong + high epistemic)
+        wrong_mask = df[f'Expert{expert_num}_Error'] > error_thresholds[j]
+        high_epistemic_mask = df[f'Expert{expert_num}_Epistemic'] > epistemic_thresholds[j]
+        untrustworthy = df[wrong_mask & high_epistemic_mask]
+        
+        if len(untrustworthy) > 0:
+            ax1.scatter(untrustworthy[f'Expert{expert_num}_Epistemic'], 
+                       untrustworthy[f'Expert{expert_num}_Error'],
+                       alpha=0.8, s=50, color=colors_expert[j], 
+                       marker='X', edgecolors='red', linewidths=1.5,
+                       label=f'{expert_name} (untrustworthy)')
+    
+    ax1.axhline(y=df['MoNIG_Error'].median(), color='gray', linestyle='--', alpha=0.5, label='Median Error')
+    ax1.axvline(x=monig_high_epistemic_thresh, color='gray', linestyle='--', alpha=0.5, label='High Epistemic')
+    ax1.set_xlabel('Expert Epistemic Uncertainty')
+    ax1.set_ylabel('Expert Prediction Error')
+    ax1.set_title('Expert Error vs Epistemic Uncertainty\n(X = Untrustworthy Cases)')
+    ax1.legend(fontsize=8)
+    ax1.grid(alpha=0.3)
+    
+    # Plot 2: MoNIG Epistemic for Untrustworthy Expert Cases
+    ax2 = axes[0, 1]
+    all_untrustworthy_indices = set()
+    for j in range(num_experts):
+        expert_num = j + 1
+        wrong_mask = df[f'Expert{expert_num}_Error'] > error_thresholds[j]
+        high_epistemic_mask = df[f'Expert{expert_num}_Epistemic'] > epistemic_thresholds[j]
+        untrustworthy = df[wrong_mask & high_epistemic_mask]
+        if len(untrustworthy) > 0:
+            all_untrustworthy_indices.update(untrustworthy.index)
+    
+    if len(all_untrustworthy_indices) > 0:
+        all_untrustworthy_df = df.loc[list(all_untrustworthy_indices)]
+        trustworthy_df = df[~df.index.isin(all_untrustworthy_indices)]
+        
+        ax2.scatter(trustworthy_df['MoNIG_Epistemic'], trustworthy_df['MoNIG_Error'],
+                   alpha=0.3, s=15, color='lightblue', label='Trustworthy cases')
+        ax2.scatter(all_untrustworthy_df['MoNIG_Epistemic'], all_untrustworthy_df['MoNIG_Error'],
+                   alpha=0.8, s=50, color='red', marker='X', edgecolors='darkred', linewidths=1.5,
+                   label='Expert untrustworthy cases')
+        
+        ax2.axvline(x=monig_high_epistemic_thresh, color='gray', linestyle='--', alpha=0.5, 
+                   label=f'High Epistemic ({monig_high_epistemic_thresh:.3f})')
+        
+        # Count how many untrustworthy cases MoNIG correctly identifies
+        correctly_identified = all_untrustworthy_df[
+            all_untrustworthy_df['MoNIG_Epistemic'] > monig_high_epistemic_thresh
+        ]
+        success_rate = len(correctly_identified) / len(all_untrustworthy_df) * 100
+        
+        ax2.set_xlabel('MoNIG Epistemic Uncertainty')
+        ax2.set_ylabel('MoNIG Prediction Error')
+        ax2.set_title(f'MoNIG Response to Untrustworthy Experts\n({success_rate:.1f}% correctly identified)')
+        ax2.legend(fontsize=8)
+        ax2.grid(alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, 'No untrustworthy cases found', 
+                ha='center', va='center', transform=ax2.transAxes)
+        ax2.set_title('MoNIG Response to Untrustworthy Experts')
+    
+    # Plot 3: Per-expert breakdown
+    ax3 = axes[1, 0]
+    expert_success_rates = []
+    expert_labels = []
+    for j in range(num_experts):
+        expert_num = j + 1
+        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+        
+        wrong_mask = df[f'Expert{expert_num}_Error'] > error_thresholds[j]
+        high_epistemic_mask = df[f'Expert{expert_num}_Epistemic'] > epistemic_thresholds[j]
+        untrustworthy = df[wrong_mask & high_epistemic_mask]
+        
+        if len(untrustworthy) > 0:
+            monig_correct = untrustworthy[untrustworthy['MoNIG_Epistemic'] > monig_high_epistemic_thresh]
+            success_rate = len(monig_correct) / len(untrustworthy) * 100
+            expert_success_rates.append(success_rate)
+            expert_labels.append(f'{expert_name}\n(n={len(untrustworthy)})')
+        else:
+            expert_success_rates.append(0)
+            expert_labels.append(f'{expert_name}\n(n=0)')
+    
+    bars = ax3.bar(expert_labels, expert_success_rates, color=colors_expert[:num_experts])
+    ax3.set_ylabel('Success Rate (%)')
+    ax3.set_title('MoNIG Success Rate: Identifying Untrustworthy Experts')
+    ax3.set_ylim([0, 105])
+    ax3.grid(axis='y', alpha=0.3)
+    for bar in bars:
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.1f}%', ha='center', va='bottom', fontweight='bold')
+    
+    # Plot 4: Example cases table visualization
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Collect top examples from each expert
+    example_text = "Top Examples: Expert Wrong + High Epistemic → MoNIG Also Uncertain\n\n"
+    
+    for j in range(num_experts):
+        expert_num = j + 1
+        expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
+        
+        wrong_mask = df[f'Expert{expert_num}_Error'] > error_thresholds[j]
+        high_epistemic_mask = df[f'Expert{expert_num}_Epistemic'] > epistemic_thresholds[j]
+        untrustworthy = df[wrong_mask & high_epistemic_mask].copy()
+        
+        if len(untrustworthy) > 0:
+            # Sort by error and epistemic
+            untrustworthy_sorted = untrustworthy.sort_values(
+                by=[f'Expert{expert_num}_Error', f'Expert{expert_num}_Epistemic'], 
+                ascending=False
+            ).head(2)  # Top 2 examples
+            
+            example_text += f"\n{expert_name}:\n"
+            for idx, row in untrustworthy_sorted.iterrows():
+                example_text += f"  • {row['ComplexID']}: "
+                example_text += f"True={row['True_Affinity']:.2f}, "
+                example_text += f"{expert_name}={row[f'Expert{expert_num}_Prediction']:.2f} "
+                example_text += f"(err={row[f'Expert{expert_num}_Error']:.2f}, "
+                example_text += f"epi={row[f'Expert{expert_num}_Epistemic']:.3f}) → "
+                example_text += f"MoNIG epi={row['MoNIG_Epistemic']:.3f}\n"
+    
+    ax4.text(0.05, 0.95, example_text, transform=ax4.transAxes,
+            fontsize=9, verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    # Save the figure
+    untrustworthy_path = output_dir / f'{stem}_untrustworthy_engines.png'
+    plt.savefig(untrustworthy_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {untrustworthy_path}")
+    
     print(f"\n✅ All visualizations saved under: {output_dir.resolve()}")
 
 
@@ -585,5 +840,6 @@ if __name__ == '__main__':
     print(f"      - {stem}_uct_confidence_band.png")
     print(f"      - {stem}_custom_analysis.png")
     print(f"      - {stem}_expert_stats.png")
+    print(f"      - {stem}_untrustworthy_engines.png")
     print("="*80)
 

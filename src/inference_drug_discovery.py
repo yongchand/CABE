@@ -4,19 +4,19 @@ Analyzes expert trustworthiness and predictions for each sample
 """
 import argparse
 import os
-import pickle
 import random
 
 import numpy as np
 import pandas as pd
 import torch
-from scipy import stats
 from torch.utils.data import DataLoader
 
-import uncertainty_toolbox as uct
-
 from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
-from src.drug_models_emb import DrugDiscoveryMoNIGEmb
+from src.drug_models_emb import (
+    DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb,
+    DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
+    DrugDiscoveryRandomForest
+)
 from src.utils import moe_nig
 
 
@@ -48,25 +48,7 @@ def aggregate_nigs(nigs):
     return mu_final, v_final, alpha_final, beta_final
 
 
-def apply_interval_calibration(y_pred, y_std, iso_model, coverage=0.682689):
-    """Recalibrate total std using isotonic interval recalibration."""
-    if iso_model is None:
-        return y_std
-    if y_pred.size == 0:
-        return y_std
-    z = stats.norm.ppf(0.5 + coverage / 2.0)
-    bounds = uct.metrics_calibration.get_prediction_interval(
-        y_pred.flatten(),
-        y_std.flatten(),
-        np.array([coverage]),
-        recal_model=iso_model
-    )
-    width = bounds.upper - bounds.lower
-    recalibrated_std = (width / (2.0 * z)).reshape(y_std.shape)
-    return recalibrated_std
-
-
-def inference_monig(model, loader, device, iso_model=None):
+def inference_monig(model, loader, device):
     """
     Run inference and extract detailed per-expert information
     
@@ -118,18 +100,6 @@ def inference_monig(model, loader, device, iso_model=None):
             
             epistemic_agg = beta_agg / (v_agg * (alpha_agg - 1))
             aleatoric_agg = beta_agg / (alpha_agg - 1)
-            total_std = np.sqrt(epistemic_agg + aleatoric_agg)
-            calibrated_std = apply_interval_calibration(
-                mu_agg, total_std, iso_model
-            )
-            total_var = total_std ** 2
-            calibrated_var = calibrated_std ** 2
-            scale = np.ones_like(calibrated_var)
-            valid_mask = total_var > 0
-            scale[valid_mask] = calibrated_var[valid_mask] / total_var[valid_mask]
-            scale = np.clip(scale, 1e-4, None)
-            epistemic_agg = epistemic_agg * scale
-            aleatoric_agg = aleatoric_agg * scale
             
             # Process each sample in batch
             for i in range(len(labels)):
@@ -194,6 +164,59 @@ def inference_monig(model, loader, device, iso_model=None):
     return pd.DataFrame(results)
 
 
+def inference_general(model, loader, device, model_type):
+    """
+    General inference function for non-MoNIG models
+    
+    Returns:
+        DataFrame with columns:
+        - ComplexID
+        - True_Affinity
+        - Prediction
+        - Uncertainty (std)
+    """
+    model.eval()
+    results = []
+    
+    with torch.no_grad():
+        for inputs, labels, complex_ids in loader:
+            expert_scores, embeddings = inputs
+            expert_scores = expert_scores.to(device)
+            embeddings = embeddings.to(device)
+            labels = labels.cpu().numpy()
+            
+            if model_type in ['DeepEnsemble', 'MCDropout', 'RandomForest']:
+                mu, std = model(expert_scores, embeddings)
+                predictions = mu.cpu().numpy()
+                uncertainties = std.cpu().numpy()
+            elif model_type == 'Gaussian':
+                mu, sigma = model(expert_scores, embeddings)
+                predictions = mu.cpu().numpy()
+                uncertainties = torch.sqrt(sigma).cpu().numpy()
+            elif model_type == 'NIG':
+                mu, v, alpha, beta = model(expert_scores, embeddings)
+                epistemic = beta / (v * (alpha - 1))
+                aleatoric = beta / (alpha - 1)
+                total_var = epistemic + aleatoric
+                predictions = mu.cpu().numpy()
+                uncertainties = torch.sqrt(total_var).cpu().numpy()
+            else:  # Baseline
+                predictions = model(expert_scores, embeddings).cpu().numpy()
+                uncertainties = np.zeros_like(predictions)
+            
+            # Process each sample in batch
+            for i in range(len(labels)):
+                result = {
+                    'ComplexID': complex_ids[i],
+                    'True_Affinity': labels[i],
+                    'Prediction': predictions[i, 0],
+                    'Uncertainty': uncertainties[i, 0],
+                }
+                results.append(result)
+    
+    return pd.DataFrame(results)
+
+
 def main():
     parser = argparse.ArgumentParser(description='MoNIG Inference - Analyze Expert Predictions')
     
@@ -207,8 +230,6 @@ def main():
                        help='Path to save output CSV (default: test_inference_results.csv)')
     parser.add_argument('--norm_stats_path', type=str, default=None,
                         help='Path to normalization stats (.npz). Defaults to model_path-derived file')
-    parser.add_argument('--calibrator_path', type=str, default=None,
-                        help='Optional isotonic calibrator (.pkl). Defaults to model_path-derived file')
     
     # Data split
     parser.add_argument('--split', type=str, default='test',
@@ -218,10 +239,25 @@ def main():
                        help='Batch size')
     
     # Model config (must match training)
+    parser.add_argument('--model_type', type=str, default=None,
+                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest'],
+                       help='Model type (auto-detected from model_path if not provided)')
     parser.add_argument('--hidden_dim', type=int, default=256,
                        help='Hidden dimension (must match training)')
     parser.add_argument('--dropout', type=float, default=0.2,
                        help='Dropout rate (must match training)')
+    parser.add_argument('--num_models', type=int, default=5,
+                       help='Number of models in ensemble (for DeepEnsemble, must match training)')
+    parser.add_argument('--num_mc_samples', type=int, default=50,
+                       help='Number of MC samples for MCDropout')
+    parser.add_argument('--n_estimators', type=int, default=100,
+                       help='Number of trees for RandomForest (must match training)')
+    parser.add_argument('--max_depth', type=int, default=20,
+                       help='Max depth for RandomForest (must match training)')
+    
+    # Reproducibility
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility')
     
     # Device
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -235,7 +271,7 @@ def main():
         args.device = 'cpu'
     
     # Set seed for reproducibility
-    set_seed(0)
+    set_seed(args.seed)
     
     # Load test set PDB IDs from test.csv file
     test_pdb_ids = None
@@ -275,20 +311,6 @@ def main():
     norm_stats = {'mean': norm_stats_npz['mean'], 'std': norm_stats_npz['std']}
     print(f"Loaded normalization stats from {norm_stats_path}")
     
-    if args.calibrator_path is not None:
-        calibrator_path = args.calibrator_path
-    else:
-        base, _ = os.path.splitext(args.model_path)
-        calibrator_path = base + '_calibrator.pkl'
-    iso_model = None
-    if os.path.exists(calibrator_path):
-        with open(calibrator_path, 'rb') as f:
-            data = pickle.load(f)
-            iso_model = data.get('iso_model')
-        print(f"Loaded isotonic calibrator from {calibrator_path}")
-    else:
-        print("No calibrator file found; proceeding without recalibration.")
-    
     # Load dataset
     print(f"\nLoading {args.split} dataset...")
     dataset = DrugDiscoveryDatasetEmb(
@@ -305,13 +327,56 @@ def main():
     class HyperParams:
         pass
     
+    # Auto-detect model type from model_path if not provided
+    if args.model_type is None:
+        model_name = os.path.basename(args.model_path)
+        if 'MoNIG' in model_name:
+            args.model_type = 'MoNIG'
+        elif 'NIG' in model_name:
+            args.model_type = 'NIG'
+        elif 'Gaussian' in model_name:
+            args.model_type = 'Gaussian'
+        elif 'DeepEnsemble' in model_name:
+            args.model_type = 'DeepEnsemble'
+        elif 'MCDropout' in model_name:
+            args.model_type = 'MCDropout'
+        elif 'RandomForest' in model_name:
+            args.model_type = 'RandomForest'
+        else:
+            args.model_type = 'Baseline'
+        print(f"Auto-detected model type: {args.model_type}")
+    
     hyp_params = HyperParams()
     hyp_params.num_experts = num_experts
     hyp_params.embedding_dim = embedding_dim
     hyp_params.hidden_dim = args.hidden_dim
     hyp_params.dropout = args.dropout
     
-    model = DrugDiscoveryMoNIGEmb(hyp_params)
+    if args.model_type == 'MoNIG':
+        model = DrugDiscoveryMoNIGEmb(hyp_params)
+    elif args.model_type == 'NIG':
+        model = DrugDiscoveryNIGEmb(hyp_params)
+    elif args.model_type == 'Gaussian':
+        model = DrugDiscoveryGaussianEmb(hyp_params)
+    elif args.model_type == 'Baseline':
+        model = DrugDiscoveryBaselineEmb(hyp_params)
+    elif args.model_type == 'DeepEnsemble':
+        hyp_params.num_models = args.num_models
+        model = DrugDiscoveryDeepEnsemble(hyp_params)
+    elif args.model_type == 'MCDropout':
+        hyp_params.num_mc_samples = args.num_mc_samples
+        model = DrugDiscoveryMCDropout(hyp_params)
+    elif args.model_type == 'RandomForest':
+        hyp_params.n_estimators = args.n_estimators
+        hyp_params.max_depth = getattr(args, 'max_depth', 20)  # Default is 20
+        hyp_params.min_samples_split = 2
+        hyp_params.min_samples_leaf = 1
+        model = DrugDiscoveryRandomForest(hyp_params)
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+    
+    if args.model_type != 'RandomForest':
+        model = model.to(args.device)
     
     # Load weights
     print(f"Loading model weights from {args.model_path}...")
@@ -321,7 +386,11 @@ def main():
     
     # Run inference
     print("\nRunning inference...")
-    df_results = inference_monig(model, loader, args.device, iso_model=iso_model)
+    if args.model_type == 'MoNIG':
+        df_results = inference_monig(model, loader, args.device)
+    else:
+        # General inference for other models
+        df_results = inference_general(model, loader, args.device, args.model_type)
     
     # Save results
     print(f"\nSaving results to {args.output_path}...")
@@ -332,49 +401,71 @@ def main():
     print("INFERENCE SUMMARY")
     print("="*70)
     print(f"Total samples: {len(df_results)}")
-    print(f"\nPrediction Accuracy:")
-    print(f"  MoNIG MAE:  {np.mean(np.abs(df_results['MoNIG_Prediction'] - df_results['True_Affinity'])):.4f}")
+    print(f"Model type: {args.model_type}")
     
-    # Print per-expert MAE dynamically
-    for j in range(num_experts):
-        expert_num = j + 1
-        expert_mae = np.mean(np.abs(df_results[f'Expert{expert_num}_Prediction'] - df_results['True_Affinity']))
-        print(f"  Expert{expert_num} MAE: {expert_mae:.4f}")
-    
-    print(f"\nExpert Confidence:")
-    for j in range(num_experts):
-        expert_num = j + 1
-        avg_nu = df_results[f'Expert{expert_num}_Confidence_nu'].mean()
-        print(f"  Expert{expert_num} avg ν: {avg_nu:.2f}")
-    
-    print(f"\nExpert Weights:")
-    for j in range(num_experts):
-        expert_num = j + 1
-        avg_weight = df_results[f'Expert{expert_num}_Weight'].mean()
-        print(f"  Expert{expert_num} avg weight: {avg_weight:.3f}")
-    
-    print(f"\nExpert Trust Distribution:")
-    for j in range(num_experts):
-        expert_num = j + 1
-        count = (df_results['More_Confident_Expert'] == expert_num).sum()
-        percentage = count / len(df_results) * 100
-        print(f"  Expert{expert_num} more confident: {count} samples ({percentage:.1f}%)")
-    
-    print(f"\nUncertainty:")
-    print(f"  Avg epistemic (MoNIG): {df_results['MoNIG_Epistemic'].mean():.4f}")
-    print(f"  Avg aleatoric (MoNIG): {df_results['MoNIG_Aleatoric'].mean():.4f}")
-    
-    # Highlight interesting cases
-    print(f"\nInteresting Cases:")
-    high_disagreement = df_results.nlargest(5, 'Expert_Disagreement')
-    print(f"\nTop 5 samples with highest expert disagreement:")
-    print(high_disagreement[['ComplexID', 'Expert1_Prediction', 'Expert2_Prediction', 
-                             'Expert_Disagreement', 'MoNIG_Prediction', 'True_Affinity']].to_string(index=False))
-    
-    high_conf_diff = df_results.nlargest(5, 'Confidence_Ratio')
-    print(f"\nTop 5 samples with highest confidence difference:")
-    print(high_conf_diff[['ComplexID', 'More_Confident_Expert', 'Confidence_Ratio',
-                          'Expert1_Weight', 'Expert2_Weight', 'MoNIG_Prediction']].to_string(index=False))
+    if args.model_type == 'MoNIG':
+        print(f"\nPrediction Accuracy:")
+        print(f"  MoNIG MAE:  {np.mean(np.abs(df_results['MoNIG_Prediction'] - df_results['True_Affinity'])):.4f}")
+        
+        # Print per-expert MAE dynamically
+        for j in range(num_experts):
+            expert_num = j + 1
+            expert_mae = np.mean(np.abs(df_results[f'Expert{expert_num}_Prediction'] - df_results['True_Affinity']))
+            print(f"  Expert{expert_num} MAE: {expert_mae:.4f}")
+        
+        print(f"\nExpert Confidence:")
+        for j in range(num_experts):
+            expert_num = j + 1
+            avg_nu = df_results[f'Expert{expert_num}_Confidence_nu'].mean()
+            print(f"  Expert{expert_num} avg ν: {avg_nu:.2f}")
+        
+        print(f"\nExpert Weights:")
+        for j in range(num_experts):
+            expert_num = j + 1
+            avg_weight = df_results[f'Expert{expert_num}_Weight'].mean()
+            print(f"  Expert{expert_num} avg weight: {avg_weight:.3f}")
+        
+        print(f"\nExpert Trust Distribution:")
+        for j in range(num_experts):
+            expert_num = j + 1
+            count = (df_results['More_Confident_Expert'] == expert_num).sum()
+            percentage = count / len(df_results) * 100
+            print(f"  Expert{expert_num} more confident: {count} samples ({percentage:.1f}%)")
+        
+        print(f"\nUncertainty:")
+        print(f"  Avg epistemic (MoNIG): {df_results['MoNIG_Epistemic'].mean():.4f}")
+        print(f"  Avg aleatoric (MoNIG): {df_results['MoNIG_Aleatoric'].mean():.4f}")
+        
+        # Highlight interesting cases
+        print(f"\nInteresting Cases:")
+        high_disagreement = df_results.nlargest(5, 'Expert_Disagreement')
+        print(f"\nTop 5 samples with highest expert disagreement:")
+        print(high_disagreement[['ComplexID', 'Expert1_Prediction', 'Expert2_Prediction', 
+                                 'Expert_Disagreement', 'MoNIG_Prediction', 'True_Affinity']].to_string(index=False))
+        
+        high_conf_diff = df_results.nlargest(5, 'Confidence_Ratio')
+        print(f"\nTop 5 samples with highest confidence difference:")
+        print(high_conf_diff[['ComplexID', 'More_Confident_Expert', 'Confidence_Ratio',
+                              'Expert1_Weight', 'Expert2_Weight', 'MoNIG_Prediction']].to_string(index=False))
+    else:
+        # General model statistics
+        pred_col = 'Prediction' if 'Prediction' in df_results.columns else 'MoNIG_Prediction'
+        true_col = 'True_Affinity'
+        unc_col = 'Uncertainty' if 'Uncertainty' in df_results.columns else None
+        
+        mae = np.mean(np.abs(df_results[pred_col] - df_results[true_col]))
+        rmse = np.sqrt(np.mean((df_results[pred_col] - df_results[true_col]) ** 2))
+        corr = np.corrcoef(df_results[pred_col], df_results[true_col])[0, 1]
+        
+        print(f"\nPrediction Accuracy:")
+        print(f"  MAE:  {mae:.4f}")
+        print(f"  RMSE: {rmse:.4f}")
+        print(f"  Correlation: {corr:.4f}")
+        
+        if unc_col and unc_col in df_results.columns:
+            print(f"\nUncertainty:")
+            print(f"  Avg uncertainty: {df_results[unc_col].mean():.4f}")
+            print(f"  Std uncertainty: {df_results[unc_col].std():.4f}")
     
     print("="*70)
     print(f"✓ Inference complete! Results saved to: {args.output_path}")
