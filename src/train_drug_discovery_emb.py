@@ -642,7 +642,11 @@ def main():
     # Load best model and fit isotonic recalibrator on validation set
     print("\n" + "="*50)
     print("Final evaluation on test set...")
-    model.load_state_dict(torch.load(model_path))
+    # RandomForest models contain sklearn objects, so we need weights_only=False
+    if args.model_type == 'RandomForest':
+        model.load_state_dict(torch.load(model_path, weights_only=False))
+    else:
+        model.load_state_dict(torch.load(model_path))
     
     iso_model = None
     calibrator_path = f'saved_models/best_{args.model_type}_emb_calibrator.pkl'

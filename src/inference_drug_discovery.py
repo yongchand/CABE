@@ -380,8 +380,13 @@ def main():
     
     # Load weights
     print(f"Loading model weights from {args.model_path}...")
-    model.load_state_dict(torch.load(args.model_path, map_location=args.device))
-    model = model.to(args.device)
+    # RandomForest models contain sklearn objects, so we need weights_only=False
+    if args.model_type == 'RandomForest':
+        model.load_state_dict(torch.load(args.model_path, map_location=args.device, weights_only=False))
+    else:
+        model.load_state_dict(torch.load(args.model_path, map_location=args.device))
+    if args.model_type != 'RandomForest':
+        model = model.to(args.device)
     print(f"Model loaded successfully!")
     
     # Run inference
