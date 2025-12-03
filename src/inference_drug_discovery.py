@@ -15,9 +15,36 @@ from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
     DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb,
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
-    DrugDiscoveryRandomForest
+    DrugDiscoveryRandomForest,
+    DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
+    DrugDiscoveryMoNIG_FixedReliability, DrugDiscoveryMoNIG_UniformWeightAggregation
 )
 from src.utils import moe_nig
+
+
+def get_conformal_intervals(y_pred, y_std, quantile):
+    """
+    Compute conformal prediction intervals.
+    
+    Args:
+        y_pred: Predictions [n_samples] or [n_samples, 1]
+        y_std: Standard deviations [n_samples] or [n_samples, 1]
+        quantile: Conformal quantile from calibration set
+    
+    Returns:
+        lower: Lower bounds [n_samples]
+        upper: Upper bounds [n_samples]
+    """
+    y_pred = np.asarray(y_pred).flatten()
+    y_std = np.asarray(y_std).flatten()
+    eps = 1e-8
+    
+    # Conformal interval: [y_pred - quantile * y_std, y_pred + quantile * y_std]
+    width = quantile * (y_std + eps)
+    lower = y_pred - width
+    upper = y_pred + width
+    
+    return lower, upper
 
 
 def set_seed(seed):
@@ -48,7 +75,7 @@ def aggregate_nigs(nigs):
     return mu_final, v_final, alpha_final, beta_final
 
 
-def inference_monig(model, loader, device):
+def inference_monig(model, loader, device, conformal_quantile=None):
     """
     Run inference and extract detailed per-expert information
     
@@ -56,12 +83,12 @@ def inference_monig(model, loader, device):
         DataFrame with columns:
         - ComplexID
         - True_Affinity
-        - Expert1_Prediction, Expert2_Prediction, Expert3_Prediction
-        - Expert1_Confidence (ν), Expert2_Confidence (ν), Expert3_Confidence (ν)
-        - Expert1_Weight, Expert2_Weight, Expert3_Weight (normalized)
+        - Expert1_Prediction, Expert2_Prediction, Expert3_Prediction, Expert4_Prediction, ...
+        - Expert1_Confidence (ν), Expert2_Confidence (ν), Expert3_Confidence (ν), Expert4_Confidence (ν), ...
+        - Expert1_Weight, Expert2_Weight, Expert3_Weight, Expert4_Weight, ... (normalized)
         - MoNIG_Prediction (aggregated)
-        - Expert1_Epistemic, Expert2_Epistemic, Expert3_Epistemic
-        - Expert1_Aleatoric, Expert2_Aleatoric, Expert3_Aleatoric
+        - Expert1_Epistemic, Expert2_Epistemic, Expert3_Epistemic, Expert4_Epistemic, ...
+        - Expert1_Aleatoric, Expert2_Aleatoric, Expert3_Aleatoric, Expert4_Aleatoric, ...
         - MoNIG_Epistemic
         - MoNIG_Aleatoric
     """
@@ -79,19 +106,30 @@ def inference_monig(model, loader, device):
             nigs = model(expert_scores, embeddings)
             num_experts = len(nigs)
             
-            # Aggregate
-            mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
+            # For UniformWeightAggregation, nigs is already aggregated (single element)
+            # We need to handle this case specially since we can't extract per-expert info
+            is_aggregated = (num_experts == 1)
             
-            # Extract all experts to numpy
-            expert_data = []
-            for j in range(num_experts):
-                mu_j, v_j, alpha_j, beta_j = [x.cpu().numpy() for x in nigs[j]]
-                expert_data.append({
-                    'mu': mu_j,
-                    'v': v_j,
-                    'alpha': alpha_j,
-                    'beta': beta_j
-                })
+            if is_aggregated:
+                # Already aggregated - use directly
+                mu_final, v_final, alpha_final, beta_final = nigs[0]
+                # Create dummy expert data for compatibility
+                expert_data = []
+                # We don't have per-expert data, so we'll skip per-expert columns
+            else:
+                # Aggregate
+                mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
+                
+                # Extract all experts to numpy
+                expert_data = []
+                for j in range(num_experts):
+                    mu_j, v_j, alpha_j, beta_j = [x.cpu().numpy() for x in nigs[j]]
+                    expert_data.append({
+                        'mu': mu_j,
+                        'v': v_j,
+                        'alpha': alpha_j,
+                        'beta': beta_j
+                    })
             
             mu_agg = mu_final.cpu().numpy()
             v_agg = v_final.cpu().numpy()
@@ -103,25 +141,9 @@ def inference_monig(model, loader, device):
             
             # Process each sample in batch
             for i in range(len(labels)):
-                # Compute weights (how much each expert contributes)
-                total_v = sum(expert_data[j]['v'][i, 0] for j in range(num_experts))
-                weights = [expert_data[j]['v'][i, 0] / total_v for j in range(num_experts)]
-                
-                # Compute uncertainties for each expert
-                expert_uncertainties = []
-                for j in range(num_experts):
-                    v_j = expert_data[j]['v'][i, 0]
-                    alpha_j = expert_data[j]['alpha'][i, 0]
-                    beta_j = expert_data[j]['beta'][i, 0]
-                    epistemic_j = beta_j / (v_j * (alpha_j - 1))
-                    aleatoric_j = beta_j / (alpha_j - 1)
-                    expert_uncertainties.append({
-                        'epistemic': epistemic_j,
-                        'aleatoric': aleatoric_j
-                    })
-                
                 epistemic_val = epistemic_agg[i, 0]
                 aleatoric_val = aleatoric_agg[i, 0]
+                total_std = np.sqrt(epistemic_val + aleatoric_val)
                 
                 # Build result dictionary
                 result = {
@@ -129,42 +151,79 @@ def inference_monig(model, loader, device):
                     'True_Affinity': labels[i],
                 }
                 
-                # Add per-expert data
-                for j in range(num_experts):
-                    expert_num = j + 1
-                    result[f'Expert{expert_num}_Prediction'] = expert_data[j]['mu'][i, 0]
-                    result[f'Expert{expert_num}_Confidence_nu'] = expert_data[j]['v'][i, 0]
-                    result[f'Expert{expert_num}_Weight'] = weights[j]
-                    result[f'Expert{expert_num}_Epistemic'] = expert_uncertainties[j]['epistemic']
-                    result[f'Expert{expert_num}_Aleatoric'] = expert_uncertainties[j]['aleatoric']
+                # Add per-expert data (skip if already aggregated)
+                if not is_aggregated:
+                    # Compute weights (how much each expert contributes)
+                    total_v = sum(expert_data[j]['v'][i, 0] for j in range(num_experts))
+                    weights = [expert_data[j]['v'][i, 0] / total_v for j in range(num_experts)]
+                    
+                    # Compute uncertainties for each expert
+                    expert_uncertainties = []
+                    for j in range(num_experts):
+                        v_j = expert_data[j]['v'][i, 0]
+                        alpha_j = expert_data[j]['alpha'][i, 0]
+                        beta_j = expert_data[j]['beta'][i, 0]
+                        epistemic_j = beta_j / (v_j * (alpha_j - 1))
+                        aleatoric_j = beta_j / (alpha_j - 1)
+                        expert_uncertainties.append({
+                            'epistemic': epistemic_j,
+                            'aleatoric': aleatoric_j
+                        })
+                    
+                    for j in range(num_experts):
+                        expert_num = j + 1
+                        result[f'Expert{expert_num}_Prediction'] = expert_data[j]['mu'][i, 0]
+                        result[f'Expert{expert_num}_Confidence_nu'] = expert_data[j]['v'][i, 0]
+                        result[f'Expert{expert_num}_Weight'] = weights[j]
+                        result[f'Expert{expert_num}_Epistemic'] = expert_uncertainties[j]['epistemic']
+                        result[f'Expert{expert_num}_Aleatoric'] = expert_uncertainties[j]['aleatoric']
+                    
+                    # Analysis: find most confident expert
+                    confidences = [expert_data[j]['v'][i, 0] for j in range(num_experts)]
+                    most_confident_idx = np.argmax(confidences)
+                    result['More_Confident_Expert'] = most_confident_idx + 1
+                    result['Confidence_Ratio'] = max(confidences) / min(confidences)
+                    
+                    # Expert disagreement: max pairwise difference
+                    predictions = [expert_data[j]['mu'][i, 0] for j in range(num_experts)]
+                    if num_experts >= 2:
+                        max_disagreement = max(abs(predictions[idx1] - predictions[idx2]) 
+                                              for idx1 in range(num_experts) 
+                                              for idx2 in range(idx1+1, num_experts))
+                        result['Expert_Disagreement'] = max_disagreement
+                    else:
+                        result['Expert_Disagreement'] = 0.0
+                else:
+                    # For aggregated models, set these to NaN
+                    result['More_Confident_Expert'] = np.nan
+                    result['Confidence_Ratio'] = np.nan
+                    result['Expert_Disagreement'] = np.nan
                 
                 # MoNIG aggregated
                 result['MoNIG_Prediction'] = mu_agg[i, 0]
                 result['MoNIG_Epistemic'] = epistemic_val
                 result['MoNIG_Aleatoric'] = aleatoric_val
+                result['MoNIG_Std'] = total_std
                 
-                # Analysis: find most confident expert
-                confidences = [expert_data[j]['v'][i, 0] for j in range(num_experts)]
-                most_confident_idx = np.argmax(confidences)
-                result['More_Confident_Expert'] = most_confident_idx + 1
-                result['Confidence_Ratio'] = max(confidences) / min(confidences)
-                
-                # Expert disagreement: max pairwise difference
-                predictions = [expert_data[j]['mu'][i, 0] for j in range(num_experts)]
-                if num_experts >= 2:
-                    max_disagreement = max(abs(predictions[idx1] - predictions[idx2]) 
-                                          for idx1 in range(num_experts) 
-                                          for idx2 in range(idx1+1, num_experts))
-                    result['Expert_Disagreement'] = max_disagreement
+                # Conformal prediction intervals
+                if conformal_quantile is not None:
+                    lower, upper = get_conformal_intervals(
+                        mu_agg[i, 0], total_std, conformal_quantile
+                    )
+                    result['Conformal_Lower'] = lower
+                    result['Conformal_Upper'] = upper
+                    result['Conformal_Width'] = upper - lower
                 else:
-                    result['Expert_Disagreement'] = 0.0
+                    result['Conformal_Lower'] = np.nan
+                    result['Conformal_Upper'] = np.nan
+                    result['Conformal_Width'] = np.nan
                 
                 results.append(result)
     
     return pd.DataFrame(results)
 
 
-def inference_general(model, loader, device, model_type):
+def inference_general(model, loader, device, model_type, conformal_quantile=None):
     """
     General inference function for non-MoNIG models
     
@@ -212,6 +271,20 @@ def inference_general(model, loader, device, model_type):
                     'Prediction': predictions[i, 0],
                     'Uncertainty': uncertainties[i, 0],
                 }
+                
+                # Conformal prediction intervals
+                if conformal_quantile is not None:
+                    lower, upper = get_conformal_intervals(
+                        predictions[i, 0], uncertainties[i, 0], conformal_quantile
+                    )
+                    result['Conformal_Lower'] = lower
+                    result['Conformal_Upper'] = upper
+                    result['Conformal_Width'] = upper - lower
+                else:
+                    result['Conformal_Lower'] = np.nan
+                    result['Conformal_Upper'] = np.nan
+                    result['Conformal_Width'] = np.nan
+                
                 results.append(result)
     
     return pd.DataFrame(results)
@@ -230,6 +303,8 @@ def main():
                        help='Path to save output CSV (default: test_inference_results.csv)')
     parser.add_argument('--norm_stats_path', type=str, default=None,
                         help='Path to normalization stats (.npz). Defaults to model_path-derived file')
+    parser.add_argument('--conformal_path', type=str, default=None,
+                        help='Path to conformal quantile (.npz). Defaults to model_path-derived file')
     
     # Data split
     parser.add_argument('--split', type=str, default='test',
@@ -311,6 +386,22 @@ def main():
     norm_stats = {'mean': norm_stats_npz['mean'], 'std': norm_stats_npz['std']}
     print(f"Loaded normalization stats from {norm_stats_path}")
     
+    # Load conformal quantile
+    if args.conformal_path is not None:
+        conformal_path = args.conformal_path
+    else:
+        base, _ = os.path.splitext(args.model_path)
+        conformal_path = base + '_conformal.npz'
+    
+    conformal_quantile = None
+    if os.path.exists(conformal_path):
+        conformal_npz = np.load(conformal_path)
+        conformal_quantile = float(conformal_npz['quantile'])
+        conformal_coverage = float(conformal_npz.get('coverage', 0.95))
+        print(f"Loaded conformal quantile: {conformal_quantile:.4f} (coverage: {conformal_coverage})")
+    else:
+        print(f"Warning: Conformal quantile not found at {conformal_path}. Inference will proceed without conformal intervals.")
+    
     # Load dataset
     print(f"\nLoading {args.split} dataset...")
     dataset = DrugDiscoveryDatasetEmb(
@@ -391,11 +482,11 @@ def main():
     
     # Run inference
     print("\nRunning inference...")
-    if args.model_type == 'MoNIG':
-        df_results = inference_monig(model, loader, args.device)
+    if args.model_type == 'MoNIG' or args.model_type.startswith('MoNIG_'):
+        df_results = inference_monig(model, loader, args.device, conformal_quantile=conformal_quantile)
     else:
         # General inference for other models
-        df_results = inference_general(model, loader, args.device, args.model_type)
+        df_results = inference_general(model, loader, args.device, args.model_type, conformal_quantile=conformal_quantile)
     
     # Save results
     print(f"\nSaving results to {args.output_path}...")

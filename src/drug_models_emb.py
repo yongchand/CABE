@@ -138,6 +138,190 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
         return scaled_nigs
 
 
+# ============================================================================
+# Ablation Model Variants for CABE
+# ============================================================================
+
+class DrugDiscoveryMoNIG_NoReliabilityScaling(DrugDiscoveryMoNIGEmb):
+    """
+    Ablation 1: Remove reliability scaling (set r_j = 1.0 for all experts)
+    This should show that MoNIG collapses without reliability scaling.
+    """
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params (same as base)
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            calibrated = self.calibrators[i](expert_i)
+            head = self.evidential_heads[i]
+            fused = head['fusion'](calibrated)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+        
+        # ABLATION: Set r_j = 1.0 (no scaling)
+        batch_size = expert_scores.shape[0]
+        reliability_scores = torch.ones(batch_size, self.num_experts, device=expert_scores.device)
+        
+        # Apply "scaling" with r_j = 1.0 (effectively no scaling)
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]
+            v_scaled = v * r_j  # v * 1.0 = v
+            alpha_scaled = 1.0 + (alpha - 1.0) * r_j + 1e-6  # alpha (no change)
+            beta_scaled = beta * r_j  # beta * 1.0 = beta
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_UniformReliability(DrugDiscoveryMoNIGEmb):
+    """
+    Ablation 2: Use uniform reliability (r_j = 1/num_experts for all experts)
+    This tests if learned reliability matters vs uniform priors.
+    """
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params (same as base)
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            calibrated = self.calibrators[i](expert_i)
+            head = self.evidential_heads[i]
+            fused = head['fusion'](calibrated)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+        
+        # ABLATION: Set uniform reliability r_j = 1/num_experts
+        batch_size = expert_scores.shape[0]
+        uniform_r = 1.0 / self.num_experts
+        reliability_scores = torch.full(
+            (batch_size, self.num_experts), 
+            uniform_r, 
+            device=expert_scores.device
+        )
+        
+        # Apply scaling with uniform reliability
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]
+            v_scaled = v * r_j
+            alpha_scaled = 1.0 + (alpha - 1.0) * r_j + 1e-6
+            beta_scaled = beta * r_j
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_FixedReliability(DrugDiscoveryMoNIGEmb):
+    """
+    Ablation 3: Use fixed reliability values (r_j = fixed_r for all experts)
+    This tests if context-dependent reliability matters.
+    """
+    def __init__(self, hyp_params, fixed_r=0.5):
+        super().__init__(hyp_params)
+        self.fixed_r = fixed_r
+    
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params (same as base)
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            calibrated = self.calibrators[i](expert_i)
+            head = self.evidential_heads[i]
+            fused = head['fusion'](calibrated)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+        
+        # ABLATION: Use fixed reliability (ignore embeddings)
+        batch_size = expert_scores.shape[0]
+        reliability_scores = torch.full(
+            (batch_size, self.num_experts), 
+            self.fixed_r, 
+            device=expert_scores.device
+        )
+        
+        # Apply scaling with fixed reliability
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]
+            v_scaled = v * r_j
+            alpha_scaled = 1.0 + (alpha - 1.0) * r_j + 1e-6
+            beta_scaled = beta * r_j
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_UniformWeightAggregation(DrugDiscoveryMoNIGEmb):
+    """
+    Ablation 4: Use uniform weight aggregation instead of MoNIG aggregation
+    This tests if MoNIG-style aggregation is necessary vs simple averaging.
+    Note: This still uses reliability scaling, but aggregates with uniform weights.
+    """
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params with reliability scaling (same as base)
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            calibrated = self.calibrators[i](expert_i)
+            head = self.evidential_heads[i]
+            fused = head['fusion'](calibrated)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+        
+        # Apply reliability scaling (keep this)
+        reliability_scores = self.reliability_net(embeddings)
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]
+            v_scaled = v * r_j
+            alpha_scaled = 1.0 + (alpha - 1.0) * r_j + 1e-6
+            beta_scaled = beta * r_j
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        # ABLATION: Use uniform weight aggregation instead of MoNIG
+        # Simple average of means and uncertainty parameters
+        mus = torch.stack([nig[0] for nig in scaled_nigs], dim=0)  # [num_experts, batch, 1]
+        vs = torch.stack([nig[1] for nig in scaled_nigs], dim=0)
+        alphas = torch.stack([nig[2] for nig in scaled_nigs], dim=0)
+        betas = torch.stack([nig[3] for nig in scaled_nigs], dim=0)
+        
+        mu_avg = mus.mean(dim=0)  # [batch, 1]
+        v_avg = vs.mean(dim=0)
+        alpha_avg = alphas.mean(dim=0)
+        beta_avg = betas.mean(dim=0)
+        
+        # Return as list for compatibility (but only one element)
+        return [(mu_avg, v_avg, alpha_avg, beta_avg)]
+
+
 class DrugDiscoveryNIGEmb(nn.Module):
     """
     Baseline: Single NIG model without mixture of experts (with embeddings)

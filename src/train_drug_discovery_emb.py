@@ -1,7 +1,11 @@
 import os
+import sys
 import argparse
 import pickle
 import random
+
+# Add parent directory to path to allow imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
@@ -16,7 +20,9 @@ from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
     DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb, 
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
-    DrugDiscoveryRandomForest
+    DrugDiscoveryRandomForest,
+    DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
+    DrugDiscoveryMoNIG_FixedReliability, DrugDiscoveryMoNIG_UniformWeightAggregation
 )
 from src.utils import moe_nig, criterion_nig as criterion_nig_original
 
@@ -62,6 +68,99 @@ def nig_uncertainty(v, alpha, beta):
     aleatoric = beta / (alpha - 1)
     epistemic = beta / (v * (alpha - 1))
     return epistemic, aleatoric
+
+
+def compute_conformal_quantile(model, loader, device, model_type, expert_indices=None, coverage=0.95):
+    """
+    Compute conformal prediction quantile from calibration set.
+    
+    Uses normalized residuals: |y - y_pred| / uncertainty for adaptive intervals,
+    or absolute residuals |y - y_pred| for fixed-width intervals.
+    
+    Args:
+        model: Trained model
+        loader: DataLoader for calibration set (typically validation set)
+        device: Device to run on
+        model_type: Model type ('MoNIG', 'NIG', 'Gaussian', etc.)
+        expert_indices: Optional expert indices for ablation
+        coverage: Target coverage probability (default: 0.95)
+    
+    Returns:
+        quantile: Quantile value for conformal intervals
+    """
+    model.eval()
+    residuals = []
+    eps = 1e-8
+    
+    with torch.no_grad():
+        for inputs, labels, _ in loader:
+            expert_scores, embeddings = inputs
+            if expert_indices is not None and len(expert_indices) < expert_scores.shape[1]:
+                expert_scores = expert_scores[:, expert_indices]
+            expert_scores = expert_scores.to(device)
+            embeddings = embeddings.to(device)
+            labels = labels.to(device).unsqueeze(1)
+            
+            if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
+                nigs = model(expert_scores, embeddings)
+                if model_type == 'MoNIG_UniformWeightAggregation':
+                    mu, v, alpha, beta = nigs[0]
+                else:
+                    mu, v, alpha, beta = aggregate_nigs(nigs)
+                epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
+                total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
+            elif model_type == 'NIG':
+                mu, v, alpha, beta = model(expert_scores, embeddings)
+                epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
+                total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
+            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest']:
+                mu, std = model(expert_scores, embeddings)
+                total_std = std
+            else:  # Baseline
+                mu = model(expert_scores, embeddings)
+                total_std = torch.ones_like(mu) * eps  # Use fixed-width intervals
+            
+            # Compute normalized residuals
+            abs_residual = torch.abs(labels - mu)
+            normalized_residual = abs_residual / (total_std + eps)
+            residuals.extend(normalized_residual.cpu().numpy().flatten())
+    
+    if len(residuals) == 0:
+        return 0.0
+    
+    residuals = np.array(residuals)
+    # Compute quantile: (n+1) * (1 - alpha) / n for finite-sample correction
+    n = len(residuals)
+    quantile_idx = int(np.ceil((n + 1) * (1 - (1 - coverage) / 2))) - 1
+    quantile_idx = min(quantile_idx, n - 1)
+    quantile = np.sort(residuals)[quantile_idx]
+    
+    return float(quantile)
+
+
+def get_conformal_intervals(y_pred, y_std, quantile):
+    """
+    Compute conformal prediction intervals.
+    
+    Args:
+        y_pred: Predictions [n_samples] or [n_samples, 1]
+        y_std: Standard deviations [n_samples] or [n_samples, 1]
+        quantile: Conformal quantile from calibration set
+    
+    Returns:
+        lower: Lower bounds [n_samples]
+        upper: Upper bounds [n_samples]
+    """
+    y_pred = np.asarray(y_pred).flatten()
+    y_std = np.asarray(y_std).flatten()
+    eps = 1e-8
+    
+    # Conformal interval: [y_pred - quantile * y_std, y_pred + quantile * y_std]
+    width = quantile * (y_std + eps)
+    lower = y_pred - width
+    upper = y_pred + width
+    
+    return lower, upper
 
 
 def criterion_gaussian(mu, sigma, y):
@@ -112,7 +211,9 @@ def set_seed(seed):
 
 
 def train_epoch(model, loader, optimizer, device, model_type, risk_weight, expert_indices=None):
-    """Train for one epoch"""
+    """
+    Train for one epoch
+    """
     model.train()
     total_loss = 0
     
@@ -130,19 +231,25 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
         
         optimizer.zero_grad()
         
-        if model_type == 'MoNIG':
+        if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
             # Get per-expert NIGs
             nigs = model(expert_scores, embeddings)
             
-            # Aggregate NIGs
-            mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
-            
-            # Compute loss for each expert + aggregated
-            loss = 0
-            for mu, v, alpha, beta in nigs:
-                loss += criterion_nig(mu, v, alpha, beta, labels, risk_weight)
-            loss += criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
-            loss = loss / (len(nigs) + 1)  # Average
+            # For UniformWeightAggregation, nigs is already aggregated (single element)
+            if model_type == 'MoNIG_UniformWeightAggregation':
+                # Already aggregated, use directly
+                mu_final, v_final, alpha_final, beta_final = nigs[0]
+                loss = criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
+            else:
+                # Aggregate NIGs
+                mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
+                
+                # Compute loss for each expert + aggregated
+                loss = 0
+                for mu, v, alpha, beta in nigs:
+                    loss += criterion_nig(mu, v, alpha, beta, labels, risk_weight)
+                loss += criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
+                loss = loss / (len(nigs) + 1)  # Average
             
         elif model_type == 'NIG':
             # Single NIG
@@ -207,9 +314,12 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
             embeddings = embeddings.to(device)
             labels = labels.to(device).unsqueeze(1)
             
-            if model_type == 'MoNIG':
+            if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
                 nigs = model(expert_scores, embeddings)
-                mu, v, alpha, beta = aggregate_nigs(nigs)
+                if model_type == 'MoNIG_UniformWeightAggregation':
+                    mu, v, alpha, beta = nigs[0]
+                else:
+                    mu, v, alpha, beta = aggregate_nigs(nigs)
                 epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
                 all_epistemic.extend(epistemic.cpu().numpy().flatten())
                 all_aleatoric.extend(aleatoric.cpu().numpy().flatten())
@@ -264,7 +374,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
     
     metrics = evaluate_predictions(all_preds, all_labels)
     
-    if model_type in ['MoNIG', 'NIG']:
+    if model_type in ['MoNIG', 'NIG'] or model_type.startswith('MoNIG_'):
         metrics['mean_epistemic'] = np.mean(all_epistemic)
         metrics['mean_aleatoric'] = np.mean(all_aleatoric)
     elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest']:
@@ -276,7 +386,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
 
 def collect_predictions_with_uncertainty(model, loader, device, model_type, expert_indices=None):
     """Return numpy arrays of predictions, stds, and true values for calibration."""
-    if model_type not in ['MoNIG', 'NIG', 'Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest']:
+    if model_type not in ['MoNIG', 'NIG', 'Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest'] and not model_type.startswith('MoNIG_'):
         return None, None, None
     
     model.eval()
@@ -294,9 +404,12 @@ def collect_predictions_with_uncertainty(model, loader, device, model_type, expe
             embeddings = embeddings.to(device)
             labels = labels.to(device).unsqueeze(1)
             
-            if model_type == 'MoNIG':
+            if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
                 nigs = model(expert_scores, embeddings)
-                mu, v, alpha, beta = aggregate_nigs(nigs)
+                if model_type == 'MoNIG_UniformWeightAggregation':
+                    mu, v, alpha, beta = nigs[0]
+                else:
+                    mu, v, alpha, beta = aggregate_nigs(nigs)
                 epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
                 total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
             elif model_type == 'NIG':
@@ -347,8 +460,10 @@ def main():
     
     # Model
     parser.add_argument('--model_type', type=str, default='MoNIG',
-                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest'],
-                       help='Model type')
+                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest',
+                                'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
+                                'MoNIG_FixedReliability', 'MoNIG_UniformWeightAggregation'],
+                       help='Model type (including ablation variants)')
     parser.add_argument('--hidden_dim', type=int, default=256,
                        help='Hidden dimension')
     parser.add_argument('--dropout', type=float, default=0.2,
@@ -369,6 +484,8 @@ def main():
                        help='Use only Expert 2 (BIND) (default: False)')
     parser.add_argument('--expert3_only', action='store_true',
                        help='Use only Expert 3 (flowdock) (default: False)')
+    parser.add_argument('--expert4_only', action='store_true',
+                       help='Use only Expert 4 (DynamicBind) (default: False)')
     
     # Training
     parser.add_argument('--epochs', type=int, default=150,
@@ -377,6 +494,8 @@ def main():
                        help='Learning rate')
     parser.add_argument('--risk_weight', type=float, default=0.005,
                        help='Risk regularization weight')
+    parser.add_argument('--conformal_coverage', type=float, default=0.95,
+                       help='Target coverage for conformal prediction intervals (default: 0.95)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     
@@ -392,15 +511,16 @@ def main():
         args.device = 'cpu'
     
     # Validate expert selection
-    expert_flags = [args.expert1_only, args.expert2_only, getattr(args, 'expert3_only', False)]
+    expert_flags = [args.expert1_only, args.expert2_only, getattr(args, 'expert3_only', False), getattr(args, 'expert4_only', False)]
     expert_mode = sum(expert_flags)
-    expert_names = ['GNINA', 'BIND', 'flowdock']
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
     
     if expert_mode == 0:
         # Use all experts (default)
         args.expert1_only = args.expert2_only = True
         args.expert3_only = True
-        expert_config = "All Experts (GNINA, BIND, flowdock)"
+        args.expert4_only = True
+        expert_config = "All Experts (GNINA, BIND, flowdock, DynamicBind)"
     elif expert_mode == 1:
         # Use single expert
         selected_idx = [i for i, flag in enumerate(expert_flags) if flag][0]
@@ -462,7 +582,7 @@ def main():
     embedding_dim, num_experts = train_dataset.get_dim()
     
     # Adjust number of experts based on selection
-    expert_flags = [args.expert1_only, args.expert2_only, getattr(args, 'expert3_only', False)]
+    expert_flags = [args.expert1_only, args.expert2_only, getattr(args, 'expert3_only', False), getattr(args, 'expert4_only', False)]
     selected_experts = [i for i, flag in enumerate(expert_flags) if flag]
     
     if len(selected_experts) == 0:
@@ -473,12 +593,12 @@ def main():
     elif len(selected_experts) == 1:
         actual_num_experts = 1
         expert_indices = selected_experts
-        expert_names = ['GNINA', 'BIND', 'flowdock']
+        expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
         print(f"\nUsing Expert {selected_experts[0] + 1} ({expert_names[selected_experts[0]]}) only")
     else:
         actual_num_experts = len(selected_experts)
         expert_indices = selected_experts
-        expert_names = ['GNINA', 'BIND', 'flowdock']
+        expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
         selected_names = [expert_names[i] for i in selected_experts]
         print(f"\nUsing experts: {', '.join(selected_names)}")
     
@@ -500,6 +620,14 @@ def main():
     
     if args.model_type == 'MoNIG':
         model = DrugDiscoveryMoNIGEmb(hyp_params)
+    elif args.model_type == 'MoNIG_NoReliabilityScaling':
+        model = DrugDiscoveryMoNIG_NoReliabilityScaling(hyp_params)
+    elif args.model_type == 'MoNIG_UniformReliability':
+        model = DrugDiscoveryMoNIG_UniformReliability(hyp_params)
+    elif args.model_type == 'MoNIG_FixedReliability':
+        model = DrugDiscoveryMoNIG_FixedReliability(hyp_params, fixed_r=0.5)
+    elif args.model_type == 'MoNIG_UniformWeightAggregation':
+        model = DrugDiscoveryMoNIG_UniformWeightAggregation(hyp_params)
     elif args.model_type == 'NIG':
         model = DrugDiscoveryNIGEmb(hyp_params)
     elif args.model_type == 'Gaussian':
@@ -622,7 +750,7 @@ def main():
             print(f"  Train Loss: {train_loss:.4f}")
             print(f"  Val MAE: {val_metrics['mae']:.4f}, RMSE: {val_metrics['rmse']:.4f}, "
                   f"Corr: {val_metrics['corr']:.4f}, R²: {val_metrics['r2']:.4f}")
-            if args.model_type in ['MoNIG', 'NIG']:
+            if args.model_type in ['MoNIG', 'NIG'] or args.model_type.startswith('MoNIG_'):
                 print(f"  Epistemic: {val_metrics['mean_epistemic']:.4f}, "
                       f"Aleatoric: {val_metrics['mean_aleatoric']:.4f}")
         
@@ -648,9 +776,20 @@ def main():
     else:
         model.load_state_dict(torch.load(model_path))
     
+    # Compute conformal prediction quantile on validation set
+    print("\nComputing conformal prediction quantile on validation set...")
+    conformal_quantile = compute_conformal_quantile(
+        model, valid_loader, args.device, args.model_type, 
+        expert_indices, coverage=args.conformal_coverage
+    )
+    conformal_path = f'saved_models/best_{args.model_type}_emb_conformal.npz'
+    np.savez(conformal_path, quantile=conformal_quantile, coverage=args.conformal_coverage)
+    print(f"Conformal quantile: {conformal_quantile:.4f} (coverage: {args.conformal_coverage})")
+    print(f"Saved conformal quantile to {conformal_path}")
+    
     iso_model = None
     calibrator_path = f'saved_models/best_{args.model_type}_emb_calibrator.pkl'
-    if args.model_type in ['MoNIG', 'NIG']:
+    if args.model_type in ['MoNIG', 'NIG'] or args.model_type.startswith('MoNIG_'):
         y_pred_val, y_std_val, y_true_val = collect_predictions_with_uncertainty(
             model, valid_loader, args.device, args.model_type, expert_indices)
         try:
@@ -683,7 +822,7 @@ def main():
         print(f"  RMSE: {test_metrics['rmse']:.4f}")
         print(f"  Correlation: {test_metrics['corr']:.4f}")
         print(f"  R²: {test_metrics['r2']:.4f}")
-        if args.model_type in ['MoNIG', 'NIG']:
+        if args.model_type in ['MoNIG', 'NIG'] or args.model_type.startswith('MoNIG_'):
             print(f"  Mean Epistemic Uncertainty: {test_metrics['mean_epistemic']:.4f}")
             print(f"  Mean Aleatoric Uncertainty: {test_metrics['mean_aleatoric']:.4f}")
         elif args.model_type == 'Gaussian':

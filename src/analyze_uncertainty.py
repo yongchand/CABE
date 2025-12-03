@@ -35,6 +35,17 @@ def analyze_uncertainty(csv_path):
     """
     df = pd.read_csv(csv_path)
     
+    # Check if conformal prediction intervals exist
+    has_conformal = 'Conformal_Lower' in df.columns and 'Conformal_Upper' in df.columns
+    
+    # Convert conformal columns to numeric if they exist (they might be stored as strings with brackets)
+    if has_conformal:
+        # Handle string format like '[2.3908916]' by stripping brackets
+        df['Conformal_Lower'] = df['Conformal_Lower'].astype(str).str.strip('[]').astype(float)
+        df['Conformal_Upper'] = df['Conformal_Upper'].astype(str).str.strip('[]').astype(float)
+        if 'Conformal_Width' in df.columns:
+            df['Conformal_Width'] = df['Conformal_Width'].astype(str).str.strip('[]').astype(float)
+    
     # Calculate prediction errors
     df['MoNIG_Error'] = np.abs(df['MoNIG_Prediction'] - df['True_Affinity'])
     
@@ -104,11 +115,60 @@ def analyze_uncertainty(csv_path):
     print(f"  PICP@90%: {picp_90:.4f} (target 0.9000)")
     print(f"  PICP@95%: {picp_95:.4f} (target 0.9500)")
     
+    # ===== Conformal Prediction Analysis =====
+    if has_conformal:
+        print("\n\n🎯 CONFORMAL PREDICTION ANALYSIS")
+        print("-" * 80)
+        
+        # Compute PICP for conformal intervals
+        conformal_inside = (df['True_Affinity'] >= df['Conformal_Lower']) & (df['True_Affinity'] <= df['Conformal_Upper'])
+        conformal_picp = conformal_inside.mean()
+        
+        # Get target coverage if available (from conformal quantile file or default)
+        # For now, assume 0.95 if not specified
+        target_coverage = 0.95  # Could be read from conformal.npz if needed
+        
+        print(f"\nConformal Prediction Intervals:")
+        print(f"  PICP: {conformal_picp:.4f} (target: {target_coverage:.4f})")
+        print(f"  Coverage Error: {abs(conformal_picp - target_coverage):.4f}")
+        
+        if conformal_picp >= target_coverage - 0.05:  # Within 5% of target
+            print(f"  ✅ Good calibration (within acceptable range)")
+        else:
+            print(f"  ⚠️  Under-coverage (intervals too narrow)")
+        
+        # Compare conformal vs standard intervals
+        standard_inside_95 = (df['True_Affinity'] >= (df['MoNIG_Prediction'] - 1.96 * df['MoNIG_Std'])) & \
+                             (df['True_Affinity'] <= (df['MoNIG_Prediction'] + 1.96 * df['MoNIG_Std']))
+        standard_picp_95 = standard_inside_95.mean()
+        
+        print(f"\nComparison with Standard 95% Intervals (z=1.96):")
+        print(f"  Standard PICP: {standard_picp_95:.4f}")
+        print(f"  Conformal PICP: {conformal_picp:.4f}")
+        print(f"  Difference: {conformal_picp - standard_picp_95:+.4f}")
+        
+        # Average interval widths
+        conformal_width = df['Conformal_Width'].mean()
+        standard_width_95 = (2 * 1.96 * df['MoNIG_Std']).mean()
+        
+        print(f"\nAverage Interval Widths:")
+        print(f"  Standard (95%): {standard_width_95:.4f}")
+        print(f"  Conformal:      {conformal_width:.4f}")
+        print(f"  Ratio:          {conformal_width / standard_width_95:.4f}")
+        
+        # Efficiency: narrower intervals with same coverage are better
+        if conformal_width < standard_width_95 and conformal_picp >= standard_picp_95:
+            print(f"  ✅ Conformal intervals are more efficient (narrower with same/better coverage)")
+        elif conformal_picp > standard_picp_95:
+            print(f"  ✅ Conformal intervals achieve better coverage")
+        else:
+            print(f"  ⚠️  Standard intervals may be more efficient")
+    
     # ===== 2. Expert Comparison with uncertainty_toolbox =====
     print("\n\n👥 EXPERT-WISE CALIBRATION METRICS")
     print("-" * 80)
     
-    expert_names = ['GNINA', 'BIND', 'flowdock']
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
     for j in range(num_experts):
         expert_num = j + 1
         expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
@@ -144,7 +204,7 @@ def analyze_uncertainty(csv_path):
     ]
     
     # Add expert-specific metrics dynamically
-    expert_names = ['GNINA', 'BIND', 'flowdock']
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
     for j in range(num_experts):
         expert_num = j + 1
         expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
@@ -243,7 +303,7 @@ def analyze_uncertainty(csv_path):
     print("\nThis section demonstrates that MoNIG correctly identifies low confidence")
     print("when individual engines are wrong and have high epistemic uncertainty.")
     
-    expert_names = ['GNINA', 'BIND', 'flowdock']
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
     
     # Define thresholds: "wrong" = error > median error, "high epistemic" = > 75th percentile
     error_thresholds = {}
@@ -368,10 +428,173 @@ def analyze_uncertainty(csv_path):
     
     print("\n" + "="*80)
     
-    return df, metrics
+    return df, metrics, has_conformal
 
 
-def visualize_uncertainty(df, output_prefix='uncertainty'):
+def plot_uncertainty_as_risk_estimator(df, output_dir, stem):
+    """
+    Create Uncertainty as Risk-Estimator plot.
+    
+    This plot shows how well uncertainty predicts prediction error/risk.
+    Key diagnostic for uncertainty quantification quality.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    fig.suptitle('Uncertainty as Risk Estimator', fontsize=16, fontweight='bold')
+    
+    # Compute total uncertainty and error
+    total_uncertainty = df['MoNIG_Total_Uncertainty'].values
+    error = df['MoNIG_Error'].values
+    epistemic = df['MoNIG_Epistemic'].values
+    aleatoric = df['MoNIG_Aleatoric'].values
+    
+    # Plot 1: Scatter plot - Total Uncertainty vs Error
+    ax1 = axes[0, 0]
+    scatter = ax1.scatter(total_uncertainty, error, alpha=0.5, s=20, c=error, cmap='plasma')
+    ax1.set_xlabel('Total Uncertainty (Epistemic + Aleatoric)')
+    ax1.set_ylabel('Prediction Error |y_true - y_pred|')
+    ax1.set_title('Uncertainty vs Error (Scatter)')
+    ax1.grid(alpha=0.3)
+    plt.colorbar(scatter, ax=ax1, label='Error')
+    
+    # Add correlation coefficient
+    corr = np.corrcoef(total_uncertainty, error)[0, 1]
+    ax1.text(0.05, 0.95, f'Correlation: {corr:.3f}', transform=ax1.transAxes,
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+             verticalalignment='top', fontsize=11)
+    
+    # Plot 2: Binned Analysis - Average Error per Uncertainty Quantile
+    ax2 = axes[0, 1]
+    df_temp = df.copy()
+    df_temp['Uncertainty_Quantile'] = pd.qcut(total_uncertainty, q=10, labels=False, duplicates='drop')
+    quantile_stats = df_temp.groupby('Uncertainty_Quantile', observed=True).agg({
+        'MoNIG_Error': ['mean', 'std', 'count'],
+        'MoNIG_Total_Uncertainty': 'mean'
+    }).reset_index()
+    
+    quantile_stats.columns = ['Quantile', 'Mean_Error', 'Std_Error', 'Count', 'Mean_Uncertainty']
+    quantile_stats = quantile_stats.sort_values('Mean_Uncertainty')
+    
+    ax2.errorbar(quantile_stats['Mean_Uncertainty'], quantile_stats['Mean_Error'],
+                yerr=quantile_stats['Std_Error'], fmt='o-', linewidth=2, markersize=8,
+                capsize=5, capthick=2, label='Mean Error ± Std')
+    
+    # Ideal line: if uncertainty perfectly predicts error, they should be proportional
+    if len(quantile_stats) > 1 and quantile_stats['Mean_Uncertainty'].max() > 0:
+        ideal_slope = quantile_stats['Mean_Error'].max() / quantile_stats['Mean_Uncertainty'].max()
+        ideal_line = ideal_slope * quantile_stats['Mean_Uncertainty']
+        ax2.plot(quantile_stats['Mean_Uncertainty'], ideal_line, 'r--', 
+                linewidth=2, alpha=0.5, label='Ideal (proportional)')
+    
+    ax2.set_xlabel('Mean Uncertainty (per quantile)')
+    ax2.set_ylabel('Mean Prediction Error')
+    ax2.set_title('Uncertainty Quantiles vs Average Error')
+    ax2.legend()
+    ax2.grid(alpha=0.3)
+    
+    # Plot 3: Epistemic vs Aleatoric as Risk Estimators
+    ax3 = axes[1, 0]
+    
+    # Create bins for epistemic and aleatoric
+    try:
+        epistemic_bins = pd.qcut(epistemic, q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
+        aleatoric_bins = pd.qcut(aleatoric, q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'], duplicates='drop')
+        
+        df_temp2 = df.copy()
+        df_temp2['Epistemic_Bin'] = epistemic_bins
+        df_temp2['Aleatoric_Bin'] = aleatoric_bins
+        
+        # Heatmap: Average error for each epistemic/aleatoric combination
+        error_heatmap = df_temp2.groupby(['Epistemic_Bin', 'Aleatoric_Bin'], observed=True)['MoNIG_Error'].mean().unstack()
+        
+        im = ax3.imshow(error_heatmap.values, cmap='YlOrRd', aspect='auto', origin='lower')
+        ax3.set_xticks(range(len(error_heatmap.columns)))
+        ax3.set_xticklabels(error_heatmap.columns, rotation=45, ha='right')
+        ax3.set_yticks(range(len(error_heatmap.index)))
+        ax3.set_yticklabels(error_heatmap.index)
+        ax3.set_xlabel('Aleatoric Uncertainty Level')
+        ax3.set_ylabel('Epistemic Uncertainty Level')
+        ax3.set_title('Average Error by Uncertainty Type')
+        plt.colorbar(im, ax=ax3, label='Mean Error')
+    except Exception as e:
+        ax3.text(0.5, 0.5, f'Could not create heatmap:\n{str(e)}', 
+                transform=ax3.transAxes, ha='center', va='center')
+        ax3.set_title('Average Error by Uncertainty Type')
+    
+    # Plot 4: Risk Estimation Quality Metrics
+    ax4 = axes[1, 1]
+    ax4.axis('off')
+    
+    # Compute various risk estimation metrics
+    metrics_text = "Risk Estimation Quality Metrics\n" + "="*50 + "\n\n"
+    
+    # Correlation metrics
+    corr_total = np.corrcoef(total_uncertainty, error)[0, 1]
+    corr_epistemic = np.corrcoef(epistemic, error)[0, 1]
+    corr_aleatoric = np.corrcoef(aleatoric, error)[0, 1]
+    
+    metrics_text += f"Correlation Coefficients:\n"
+    metrics_text += f"  Total Uncertainty:     {corr_total:+.4f}\n"
+    metrics_text += f"  Epistemic Uncertainty: {corr_epistemic:+.4f}\n"
+    metrics_text += f"  Aleatoric Uncertainty: {corr_aleatoric:+.4f}\n\n"
+    
+    # Quantile analysis
+    low_unc_q = np.percentile(total_uncertainty, 25)
+    high_unc_q = np.percentile(total_uncertainty, 75)
+    
+    low_unc_mask = total_uncertainty <= low_unc_q
+    high_unc_mask = total_uncertainty >= high_unc_q
+    
+    error_ratio = None
+    if np.sum(low_unc_mask) > 0 and np.sum(high_unc_mask) > 0:
+        low_unc_error = df.loc[low_unc_mask, 'MoNIG_Error'].mean()
+        high_unc_error = df.loc[high_unc_mask, 'MoNIG_Error'].mean()
+        error_ratio = high_unc_error / low_unc_error if low_unc_error > 0 else np.nan
+        
+        metrics_text += f"Error by Uncertainty Quartiles:\n"
+        metrics_text += f"  Low Uncertainty (Q1):  {low_unc_error:.4f}\n"
+        metrics_text += f"  High Uncertainty (Q4):  {high_unc_error:.4f}\n"
+        metrics_text += f"  Error Ratio (Q4/Q1):   {error_ratio:.2f}x\n\n"
+    else:
+        error_ratio = np.nan
+        metrics_text += "Error by Uncertainty Quartiles:\n"
+        metrics_text += "  (Insufficient data for quartile analysis)\n\n"
+    
+    # Risk estimation quality
+    if corr_total > 0.5:
+        quality = "✅ Excellent"
+    elif corr_total > 0.3:
+        quality = "⚠️  Moderate"
+    elif corr_total > 0.1:
+        quality = "⚠️  Weak"
+    else:
+        quality = "❌ Poor"
+    
+    metrics_text += f"Risk Estimation Quality: {quality}\n"
+    metrics_text += f"  (Based on correlation: {corr_total:.3f})\n\n"
+    
+    # Coverage analysis
+    if error_ratio is not None and not np.isnan(error_ratio):
+        if error_ratio > 1.5:
+            metrics_text += "✅ High uncertainty cases have significantly higher error\n"
+        elif error_ratio > 1.2:
+            metrics_text += "⚠️  Moderate difference between low/high uncertainty cases\n"
+        else:
+            metrics_text += "❌ Uncertainty does not reliably predict error\n"
+    
+    ax4.text(0.05, 0.95, metrics_text, transform=ax4.transAxes,
+            fontsize=10, verticalalignment='top', family='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    risk_path = output_dir / f'{stem}_uncertainty_risk_estimator.png'
+    plt.savefig(risk_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved: {risk_path}")
+    
+    return corr_total, error_ratio
+
+
+def visualize_uncertainty(df, output_prefix='uncertainty', has_conformal=False):
     """
     Create comprehensive uncertainty visualizations using uncertainty_toolbox
     """
@@ -604,7 +827,7 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
     all_confidences = np.concatenate([df[f'Expert{j+1}_Confidence_nu'].values for j in range(num_experts)])
     bins = np.logspace(np.log10(max(all_confidences.min(), 1e-3)),
                        np.log10(all_confidences.max()), 40)
-    expert_names = ['GNINA', 'BIND', 'flowdock']
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
     for j in range(num_experts):
         expert_num = j + 1
         expert_name = expert_names[j] if j < len(expert_names) else f'Expert {expert_num}'
@@ -649,8 +872,8 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
     fig.suptitle('MoNIG Identifies When NOT to Trust Engines', fontsize=16, fontweight='bold')
     
-    expert_names = ['GNINA', 'BIND', 'flowdock']
-    colors_expert = ['coral', 'skyblue', 'lightgreen']
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
+    colors_expert = ['coral', 'skyblue', 'lightgreen', 'orange', 'purple', 'pink', 'cyan', 'yellow']
     
     # Calculate thresholds
     error_thresholds = {}
@@ -805,6 +1028,111 @@ def visualize_uncertainty(df, output_prefix='uncertainty'):
     plt.close()
     print(f"  ✓ Saved: {untrustworthy_path}")
     
+    # ===== 5. Conformal Prediction Visualization =====
+    if has_conformal:
+        print("\n📊 Generating conformal prediction visualizations...")
+        
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        fig.suptitle('Conformal Prediction Analysis', fontsize=16, fontweight='bold')
+        
+        # Plot 1: Conformal intervals coverage
+        ax1 = axes[0, 0]
+        n_subset = min(200, len(df))
+        subset_idx = np.random.choice(len(df), n_subset, replace=False)
+        subset_df = df.iloc[subset_idx].sort_values('MoNIG_Prediction')
+        
+        x_vals = np.arange(len(subset_df))
+        ax1.fill_between(x_vals, subset_df['Conformal_Lower'], subset_df['Conformal_Upper'],
+                        alpha=0.3, color='blue', label='Conformal Interval')
+        ax1.scatter(x_vals, subset_df['True_Affinity'], alpha=0.6, s=20, color='red', 
+                   marker='x', label='True Value')
+        ax1.plot(x_vals, subset_df['MoNIG_Prediction'], 'k-', alpha=0.5, linewidth=1, label='Prediction')
+        ax1.set_xlabel('Sample Index (sorted by prediction)')
+        ax1.set_ylabel('Affinity')
+        ax1.set_title('Conformal Prediction Intervals')
+        ax1.legend()
+        ax1.grid(alpha=0.3)
+        
+        # Plot 2: Coverage comparison
+        ax2 = axes[0, 1]
+        standard_lower_95 = df['MoNIG_Prediction'] - 1.96 * df['MoNIG_Std']
+        standard_upper_95 = df['MoNIG_Prediction'] + 1.96 * df['MoNIG_Std']
+        
+        standard_inside_95 = (df['True_Affinity'] >= standard_lower_95) & (df['True_Affinity'] <= standard_upper_95)
+        conformal_inside = (df['True_Affinity'] >= df['Conformal_Lower']) & (df['True_Affinity'] <= df['Conformal_Upper'])
+        
+        comparison_data = {
+            'Standard (95%)': [standard_inside_95.mean(), (2 * 1.96 * df['MoNIG_Std']).mean()],
+            'Conformal': [conformal_inside.mean(), df['Conformal_Width'].mean()]
+        }
+        
+        x_pos = np.arange(2)
+        width = 0.35
+        ax2_twin = ax2.twinx()
+        
+        bars1 = ax2.bar(x_pos - width/2, [comparison_data['Standard (95%)'][0], comparison_data['Conformal'][0]], 
+                        width, label='PICP', color=['skyblue', 'lightcoral'], alpha=0.7)
+        bars2 = ax2_twin.bar(x_pos + width/2, [comparison_data['Standard (95%)'][1], comparison_data['Conformal'][1]], 
+                             width, label='Avg Width', color=['darkblue', 'darkred'], alpha=0.7)
+        
+        ax2.set_ylabel('PICP (Coverage)', color='black')
+        ax2_twin.set_ylabel('Average Interval Width', color='black')
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels(['Standard (95%)', 'Conformal'])
+        ax2.set_title('Coverage and Width Comparison')
+        ax2.axhline(y=0.95, color='green', linestyle='--', alpha=0.5, label='Target (95%)')
+        ax2.legend(loc='upper left')
+        ax2_twin.legend(loc='upper right')
+        ax2.grid(alpha=0.3, axis='y')
+        
+        # Plot 3: Interval width distribution
+        ax3 = axes[1, 0]
+        ax3.hist(df['Conformal_Width'], bins=50, alpha=0.7, color='blue', label='Conformal', density=True)
+        ax3.hist(2 * 1.96 * df['MoNIG_Std'], bins=50, alpha=0.7, color='orange', label='Standard (95%)', density=True)
+        ax3.set_xlabel('Interval Width')
+        ax3.set_ylabel('Density')
+        ax3.set_title('Interval Width Distribution')
+        ax3.legend()
+        ax3.grid(alpha=0.3, axis='y')
+        
+        # Plot 4: Coverage by uncertainty level
+        ax4 = axes[1, 1]
+        df['Uncertainty_Quantile'] = pd.qcut(df['MoNIG_Std'], q=4, labels=['Q1 (Low)', 'Q2', 'Q3', 'Q4 (High)'])
+        
+        conformal_by_quantile = df.groupby('Uncertainty_Quantile', observed=True).apply(
+            lambda g: ((g['True_Affinity'] >= g['Conformal_Lower']) & (g['True_Affinity'] <= g['Conformal_Upper'])).mean()
+        )
+        standard_by_quantile = df.groupby('Uncertainty_Quantile', observed=True).apply(
+            lambda g: ((g['True_Affinity'] >= (g['MoNIG_Prediction'] - 1.96 * g['MoNIG_Std'])) & 
+                      (g['True_Affinity'] <= (g['MoNIG_Prediction'] + 1.96 * g['MoNIG_Std']))).mean()
+        )
+        
+        x_pos_quant = np.arange(len(conformal_by_quantile))
+        ax4.plot(x_pos_quant, conformal_by_quantile.values, 'o-', label='Conformal', linewidth=2, markersize=8)
+        ax4.plot(x_pos_quant, standard_by_quantile.values, 's-', label='Standard (95%)', linewidth=2, markersize=8)
+        ax4.axhline(y=0.95, color='green', linestyle='--', alpha=0.5, label='Target (95%)')
+        ax4.set_xticks(x_pos_quant)
+        ax4.set_xticklabels(conformal_by_quantile.index)
+        ax4.set_ylabel('PICP (Coverage)')
+        ax4.set_xlabel('Uncertainty Quantile')
+        ax4.set_title('Coverage by Uncertainty Level')
+        ax4.legend()
+        ax4.grid(alpha=0.3)
+        ax4.set_ylim([0.7, 1.0])
+        
+        plt.tight_layout()
+        conformal_path = output_dir / f'{stem}_conformal_analysis.png'
+        plt.savefig(conformal_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved: {conformal_path}")
+    
+    # ===== 6. Uncertainty as Risk Estimator =====
+    print("\n📊 Generating Uncertainty as Risk Estimator plot...")
+    try:
+        plot_uncertainty_as_risk_estimator(df, output_dir, stem)
+    except Exception as e:
+        print(f"  ⚠ Skipped risk estimator plot: {e}")
+    
     print(f"\n✅ All visualizations saved under: {output_dir.resolve()}")
 
 
@@ -820,10 +1148,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     # Run analysis
-    df, metrics = analyze_uncertainty(args.csv)
+    df, metrics, has_conformal = analyze_uncertainty(args.csv)
     
     # Create visualizations
-    visualize_uncertainty(df, args.output_prefix)
+    visualize_uncertainty(df, args.output_prefix, has_conformal=has_conformal)
     
     base = Path(args.output_prefix)
     stem = base.name
@@ -841,5 +1169,8 @@ if __name__ == '__main__':
     print(f"      - {stem}_custom_analysis.png")
     print(f"      - {stem}_expert_stats.png")
     print(f"      - {stem}_untrustworthy_engines.png")
+    print(f"      - {stem}_uncertainty_risk_estimator.png")
+    if has_conformal:
+        print(f"      - {stem}_conformal_analysis.png")
     print("="*80)
 

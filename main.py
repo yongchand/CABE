@@ -45,8 +45,10 @@ Examples:
     
     # Model
     train_parser.add_argument('--model_type', type=str, default='MoNIG',
-                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest'],
-                             help='Model type')
+                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest',
+                                      'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
+                                      'MoNIG_FixedReliability', 'MoNIG_UniformWeightAggregation'],
+                             help='Model type (including ablation variants)')
     train_parser.add_argument('--hidden_dim', type=int, default=256,
                              help='Hidden dimension')
     train_parser.add_argument('--dropout', type=float, default=0.2,
@@ -67,6 +69,8 @@ Examples:
                              help='Use only Expert 2 (BIND)')
     train_parser.add_argument('--expert3_only', action='store_true',
                              help='Use only Expert 3 (flowdock)')
+    train_parser.add_argument('--expert4_only', action='store_true',
+                             help='Use only Expert 4 (DynamicBind)')
     
     # Training
     train_parser.add_argument('--epochs', type=int, default=150,
@@ -75,6 +79,8 @@ Examples:
                              help='Learning rate')
     train_parser.add_argument('--risk_weight', type=float, default=0.005,
                              help='Risk regularization weight')
+    train_parser.add_argument('--conformal_coverage', type=float, default=0.95,
+                             help='Target coverage for conformal prediction intervals (default: 0.95)')
     train_parser.add_argument('--seed', type=int, default=42,
                              help='Random seed')
     
@@ -96,6 +102,8 @@ Examples:
                              help='Path to save output CSV')
     infer_parser.add_argument('--norm_stats_path', type=str, default=None,
                              help='Path to normalization stats (.npz). Auto-detected if not provided')
+    infer_parser.add_argument('--conformal_path', type=str, default=None,
+                             help='Path to conformal quantile (.npz). Auto-detected if not provided')
     
     # Data split
     infer_parser.add_argument('--split', type=str, default='test',
@@ -152,6 +160,7 @@ Examples:
             '--epochs', str(args.epochs),
             '--lr', str(args.lr),
             '--risk_weight', str(args.risk_weight),
+            '--conformal_coverage', str(args.conformal_coverage),
             '--seed', str(args.seed),
             '--device', args.device,
         ]
@@ -163,6 +172,8 @@ Examples:
             train_args.append('--expert2_only')
         if args.expert3_only:
             train_args.append('--expert3_only')
+        if args.expert4_only:
+            train_args.append('--expert4_only')
         
         # Temporarily replace sys.argv and call train_main
         old_argv = sys.argv
@@ -192,6 +203,8 @@ Examples:
         ]
         if args.norm_stats_path:
             infer_args.extend(['--norm_stats_path', args.norm_stats_path])
+        if args.conformal_path:
+            infer_args.extend(['--conformal_path', args.conformal_path])
         
         # Temporarily replace sys.argv and call inference_main
         old_argv = sys.argv
@@ -203,17 +216,17 @@ Examples:
             
     elif args.mode == 'analyze':
         # Run uncertainty analysis directly
-        df, _ = analyze_uncertainty(args.csv)
+        df, _, has_conformal = analyze_uncertainty(args.csv)
         
         # Create visualizations
-        visualize_uncertainty(df, args.output_prefix)
+        visualize_uncertainty(df, args.output_prefix, has_conformal=has_conformal)
         
         base = Path(args.output_prefix)
         stem = base.name
         base_dir = base.parent if str(base.parent) != '.' else Path('.')
         output_dir = base_dir / f"{stem}_figures"
         print("\n" + "="*80)
-        print("✅ Uncertainty analysis complete!")
+        print("Uncertainty analysis complete!")
         print("="*80)
         print("\nGenerated directories/files:")
         print(f"  • {output_dir} ->")

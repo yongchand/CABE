@@ -30,15 +30,25 @@ class DrugDiscoveryDatasetEmb(Dataset):
             print(f"Found {len(emb_cols)} embedding dimensions")
         
         # Expert score columns
-        self.expert_cols = ['GNINA_Affinity', 'BIND_pIC50', 'flowdock_score']
+        self.expert_cols = ['GNINA_Affinity', 'BIND_pIC50', 'flowdock_score', 'DynamicBind_score']
         
         # Parse binding affinity labels and get valid indices
-        labels, valid_mask = self._parse_affinity(df['Binding_Affinity'].values)
+        labels, affinity_valid_mask = self._parse_affinity(df['Binding_Affinity'].values)
         
-        # Filter out invalid samples
+        # Filter out invalid samples (both affinity parsing and NaN expert scores)
+        # Check for NaN values in expert scores
+        expert_nan_mask = ~df[self.expert_cols].isna().any(axis=1).values
+        valid_mask = affinity_valid_mask & expert_nan_mask
+        
         valid_indices = np.where(valid_mask)[0]
         if split == 'train':
-            print(f"Valid samples after parsing affinity: {len(valid_indices)} / {len(df)} "
+            affinity_valid_count = np.sum(affinity_valid_mask)
+            print(f"Valid samples after parsing affinity: {affinity_valid_count} / {len(df)} "
+                  f"({affinity_valid_count/len(df)*100:.1f}%)")
+            nan_expert_count = np.sum(~expert_nan_mask)
+            if nan_expert_count > 0:
+                print(f"Filtered out {nan_expert_count} samples with NaN expert scores")
+            print(f"Final valid samples: {len(valid_indices)} / {len(df)} "
                   f"({len(valid_indices)/len(df)*100:.1f}%)")
         
         # Extract features for valid samples only
