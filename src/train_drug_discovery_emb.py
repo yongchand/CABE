@@ -20,9 +20,11 @@ from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
     DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb, 
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
-    DrugDiscoveryRandomForest,
     DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
-    DrugDiscoveryMoNIG_FixedReliability, DrugDiscoveryMoNIG_UniformWeightAggregation
+    DrugDiscoveryMoNIG_NoContextReliability, DrugDiscoveryMoNIG_UniformWeightAggregation,
+    DrugDiscoverySoftmaxMoE, 
+    DrugDiscoveryDeepEnsembleMVE,
+    DrugDiscoveryCFGP, DrugDiscoverySWAG
 )
 from src.utils import moe_nig, criterion_nig as criterion_nig_original
 
@@ -113,7 +115,7 @@ def compute_conformal_quantile(model, loader, device, model_type, expert_indices
                 mu, v, alpha, beta = model(expert_scores, embeddings)
                 epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
                 total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
-            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest']:
+            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
                 mu, std = model(expert_scores, embeddings)
                 total_std = std
             else:  # Baseline
@@ -179,6 +181,8 @@ def criterion_gaussian(mu, sigma, y):
     return loss
 
 
+
+
 def evaluate_predictions(mu, y_true):
     """
     Compute standard regression metrics
@@ -206,8 +210,9 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    # Set deterministic behavior for cuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def train_epoch(model, loader, optimizer, device, model_type, risk_weight, expert_indices=None):
@@ -275,10 +280,35 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
             x = torch.cat([expert_scores, embeddings], dim=1)
             predictions = model.model(x)
             loss = torch.nn.functional.mse_loss(predictions, labels)
+        
+        elif model_type == 'SWAG':
+            # SWAG: train base model normally, collect snapshots later
+            # Use the base model inside SWAG for training
+            mu, sigma = model.base_model(expert_scores, embeddings)
+            loss = criterion_gaussian(mu, sigma, labels)
             
-        elif model_type == 'RandomForest':
-            # Random Forest doesn't use gradient descent - skip this function
-            raise ValueError("RandomForest should be trained using fit() method, not train_epoch()")
+        elif model_type == 'SoftmaxMoE':
+            # Softmax MoE: mean and std prediction
+            mu, std = model(expert_scores, embeddings)
+            # Use Gaussian NLL loss
+            variance = std ** 2
+            loss = criterion_gaussian(mu, variance, labels)
+            
+        elif model_type == 'DeepEnsembleMVE':
+            # Deep Ensemble with MVE
+            mu, std = model(expert_scores, embeddings)
+            # Use Gaussian NLL loss
+            variance = std ** 2
+            loss = criterion_gaussian(mu, variance, labels)
+            
+        elif model_type == 'CFGP':
+            # Convolutional-Fed Gaussian Process
+            mu, std, kl_div = model(expert_scores, embeddings, compute_loss_terms=True)
+            # Negative log-likelihood loss
+            nll_loss = criterion_gaussian(mu, std ** 2, labels)
+            # KL divergence for variational GP (regularization)
+            kl_weight = 0.01  # Weight for KL term
+            loss = nll_loss + kl_weight * kl_div / len(loader.dataset)  # Scale KL by dataset size
             
         else:  # Baseline
             predictions = model(expert_scores, embeddings)
@@ -342,7 +372,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
                 mu, std = model(expert_scores, embeddings)
                 all_variance.extend((std ** 2).cpu().numpy().flatten())
                 
-            elif model_type == 'RandomForest':
+            elif model_type in ['SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
                 mu, std = model(expert_scores, embeddings)
                 all_variance.extend((std ** 2).cpu().numpy().flatten())
                 
@@ -377,7 +407,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
     if model_type in ['MoNIG', 'NIG'] or model_type.startswith('MoNIG_'):
         metrics['mean_epistemic'] = np.mean(all_epistemic)
         metrics['mean_aleatoric'] = np.mean(all_aleatoric)
-    elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest']:
+    elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
         metrics['mean_variance'] = np.mean(all_variance)
         metrics['mean_std'] = np.sqrt(metrics['mean_variance'])
     
@@ -386,7 +416,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
 
 def collect_predictions_with_uncertainty(model, loader, device, model_type, expert_indices=None):
     """Return numpy arrays of predictions, stds, and true values for calibration."""
-    if model_type not in ['MoNIG', 'NIG', 'Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest'] and not model_type.startswith('MoNIG_'):
+    if model_type not in ['MoNIG', 'NIG', 'Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'SWAG'] and not model_type.startswith('MoNIG_'):
         return None, None, None
     
     model.eval()
@@ -416,7 +446,7 @@ def collect_predictions_with_uncertainty(model, loader, device, model_type, expe
                 mu, v, alpha, beta = model(expert_scores, embeddings)
                 epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
                 total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
-            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'RandomForest']:
+            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
                 mu, std = model(expert_scores, embeddings)
                 total_std = std
             else:
@@ -460,10 +490,11 @@ def main():
     
     # Model
     parser.add_argument('--model_type', type=str, default='MoNIG',
-                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest',
+                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
                                 'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
-                                'MoNIG_FixedReliability', 'MoNIG_UniformWeightAggregation'],
-                       help='Model type (including ablation variants)')
+                                'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
+                                'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                       help='Model type (including ablation variants and UQ baselines)')
     parser.add_argument('--hidden_dim', type=int, default=256,
                        help='Hidden dimension')
     parser.add_argument('--dropout', type=float, default=0.2,
@@ -472,10 +503,18 @@ def main():
                        help='Number of models in ensemble (for DeepEnsemble)')
     parser.add_argument('--num_mc_samples', type=int, default=50,
                        help='Number of MC samples for MCDropout')
-    parser.add_argument('--n_estimators', type=int, default=100,
-                       help='Number of trees for RandomForest')
-    parser.add_argument('--max_depth', type=int, default=20,
-                       help='Max depth for RandomForest (default: 20)')
+    parser.add_argument('--num_inducing', type=int, default=128,
+                       help='Number of inducing points for CFGP (default: 128)')
+    parser.add_argument('--max_num_models', type=int, default=20,
+                       help='Maximum number of models for SWAG (default: 20)')
+    parser.add_argument('--swag_start', type=int, default=75,
+                       help='Epoch to start collecting SWAG models (default: 75)')
+    parser.add_argument('--swag_lr', type=float, default=1e-3,
+                       help='Learning rate for SWAG collection (default: 1e-3)')
+    parser.add_argument('--swag_freq', type=int, default=1,
+                       help='Frequency of collecting SWAG models (default: 1, every epoch)')
+    parser.add_argument('--num_swag_samples', type=int, default=30,
+                       help='Number of SWAG samples for inference (default: 30)')
     
     # Expert selection (for ablation studies)
     parser.add_argument('--expert1_only', action='store_true',
@@ -624,8 +663,8 @@ def main():
         model = DrugDiscoveryMoNIG_NoReliabilityScaling(hyp_params)
     elif args.model_type == 'MoNIG_UniformReliability':
         model = DrugDiscoveryMoNIG_UniformReliability(hyp_params)
-    elif args.model_type == 'MoNIG_FixedReliability':
-        model = DrugDiscoveryMoNIG_FixedReliability(hyp_params, fixed_r=0.5)
+    elif args.model_type == 'MoNIG_NoContextReliability':
+        model = DrugDiscoveryMoNIG_NoContextReliability(hyp_params)
     elif args.model_type == 'MoNIG_UniformWeightAggregation':
         model = DrugDiscoveryMoNIG_UniformWeightAggregation(hyp_params)
     elif args.model_type == 'NIG':
@@ -638,84 +677,39 @@ def main():
     elif args.model_type == 'MCDropout':
         hyp_params.num_mc_samples = args.num_mc_samples
         model = DrugDiscoveryMCDropout(hyp_params)
-    elif args.model_type == 'RandomForest':
-        hyp_params.n_estimators = args.n_estimators
-        hyp_params.max_depth = args.max_depth  # Default is 20
-        hyp_params.min_samples_split = 2
-        hyp_params.min_samples_leaf = 1
-        model = DrugDiscoveryRandomForest(hyp_params)
+    elif args.model_type == 'SoftmaxMoE':
+        model = DrugDiscoverySoftmaxMoE(hyp_params)
+    elif args.model_type == 'DeepEnsembleMVE':
+        hyp_params.num_models = args.num_models
+        model = DrugDiscoveryDeepEnsembleMVE(hyp_params)
+    elif args.model_type == 'CFGP':
+        hyp_params.num_inducing = args.num_inducing if hasattr(args, 'num_inducing') else 128
+        model = DrugDiscoveryCFGP(hyp_params)
+    elif args.model_type == 'SWAG':
+        hyp_params.max_num_models = args.max_num_models if hasattr(args, 'max_num_models') else 20
+        hyp_params.no_cov_mat = True  # Use diagonal covariance for efficiency
+        hyp_params.num_swag_samples = args.num_swag_samples if hasattr(args, 'num_swag_samples') else 30
+        model = DrugDiscoverySWAG(hyp_params)
+        # Base model is stored inside SWAG wrapper
+        base_model = model.base_model
     else:
         model = DrugDiscoveryBaselineEmb(hyp_params)
     
-    if args.model_type != 'RandomForest':
-        model = model.to(args.device)
-    
-    if args.model_type == 'RandomForest':
-        print(f"\nModel created: RandomForest with {args.n_estimators} trees")
-    else:
-        print(f"\nModel created: {sum(p.numel() for p in model.parameters())} parameters")
-    
-    # Special handling for RandomForest (no gradient descent)
-    if args.model_type == 'RandomForest':
-        print("\nTraining RandomForest...")
-        # Collect all training data
-        X_train = []
-        y_train = []
-        for inputs, labels, _ in train_loader:
-            expert_scores, embeddings = inputs
-            if expert_indices is not None and len(expert_indices) < expert_scores.shape[1]:
-                expert_scores = expert_scores[:, expert_indices]
-            # Concatenate features
-            features = torch.cat([expert_scores, embeddings], dim=1).cpu().numpy()
-            X_train.append(features)
-            y_train.append(labels.cpu().numpy())
-        
-        X_train = np.concatenate(X_train, axis=0)
-        y_train = np.concatenate(y_train, axis=0)
-        
-        # Train RandomForest
-        model.fit(X_train, y_train)
-        print("RandomForest training complete!")
-        
-        # Evaluate on validation set
-        val_metrics = evaluate(model, valid_loader, args.device, args.model_type, expert_indices)
-        print(f"\nValidation Results:")
-        print(f"  MAE: {val_metrics['mae']:.4f}, RMSE: {val_metrics['rmse']:.4f}, "
-              f"Corr: {val_metrics['corr']:.4f}, R²: {val_metrics['r2']:.4f}")
-        if 'mean_std' in val_metrics:
-            print(f"  Mean Std: {val_metrics['mean_std']:.4f}")
-        
-        # Save model
-        os.makedirs('saved_models', exist_ok=True)
-        model_path = f'saved_models/best_{args.model_type}_emb.pt'
-        norm_stats_path = f'saved_models/best_{args.model_type}_emb_norm_stats.npz'
-        torch.save(model.state_dict(), model_path)
-        print(f"Model saved to {model_path}")
-        
-        # Save normalization stats
-        np.savez(norm_stats_path,
-                 mean=norm_stats['mean'],
-                 std=norm_stats['std'])
-        print(f"Normalization stats saved to {norm_stats_path}")
-        
-        # Evaluate on test set if available
-        if len(test_dataset) > 0:
-            test_metrics = evaluate(model, test_loader, args.device, args.model_type, expert_indices)
-            print(f"\nTest Results:")
-            print(f"  MAE: {test_metrics['mae']:.4f}")
-            print(f"  RMSE: {test_metrics['rmse']:.4f}")
-            print(f"  Correlation: {test_metrics['corr']:.4f}")
-            print(f"  R²: {test_metrics['r2']:.4f}")
-            if 'mean_std' in test_metrics:
-                print(f"  Mean Std: {test_metrics['mean_std']:.4f}")
-        else:
-            print("\nTest Results: [Skipped - test set is empty]")
-        
-        print("="*50)
-        return
+    model = model.to(args.device)
+    print(f"\nModel created: {sum(p.numel() for p in model.parameters())} parameters")
     
     # Optimizer and scheduler (for neural network models)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    if args.model_type == 'SWAG':
+        # For SWAG, optimize the base_model (separate from SWAG wrapper's internal base)
+        base_model = model.base_model
+        optimizer = optim.Adam(base_model.parameters(), lr=args.lr, weight_decay=1e-5)
+        # SWAG collection uses a separate optimizer with different LR
+        swag_optimizer = optim.Adam(base_model.parameters(), lr=args.swag_lr, weight_decay=1e-5) if hasattr(args, 'swag_lr') else None
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+        swag_optimizer = None
+        base_model = None
+    
     scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
     
     # Training loop
@@ -744,6 +738,32 @@ def main():
         if new_lr < old_lr:
             print(f"  → Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
         
+        # SWAG collection (after swag_start epoch)
+        if args.model_type == 'SWAG' and epoch >= args.swag_start and epoch % args.swag_freq == 0:
+            # Switch to SWAG learning rate for collection
+            if swag_optimizer is not None:
+                for param_group in swag_optimizer.param_groups:
+                    param_group['lr'] = args.swag_lr
+                # Do one step with SWAG LR
+                for batch_idx, (inputs, labels, _) in enumerate(train_loader):
+                    expert_scores, embeddings = inputs
+                    if expert_indices is not None and len(expert_indices) < 2:
+                        expert_scores = expert_scores[:, expert_indices]
+                    expert_scores = expert_scores.to(args.device)
+                    embeddings = embeddings.to(args.device)
+                    labels = labels.to(args.device).unsqueeze(1)
+                    
+                    swag_optimizer.zero_grad()
+                    mu, sigma = base_model(expert_scores, embeddings)
+                    loss = criterion_gaussian(mu, sigma, labels)
+                    loss.backward()
+                    swag_optimizer.step()
+                    break  # Just one batch for SWAG collection
+            
+            # Collect model snapshot
+            model.collect_model(base_model)
+            print(f"  → Collected SWAG model snapshot (n={model.swag.n_models.item()})")
+        
         # Print progress
         if epoch % 5 == 0 or epoch == 1:
             print(f"\nEpoch {epoch}/{args.epochs}")
@@ -753,12 +773,18 @@ def main():
             if args.model_type in ['MoNIG', 'NIG'] or args.model_type.startswith('MoNIG_'):
                 print(f"  Epistemic: {val_metrics['mean_epistemic']:.4f}, "
                       f"Aleatoric: {val_metrics['mean_aleatoric']:.4f}")
+            if args.model_type == 'SWAG' and epoch >= args.swag_start:
+                print(f"  SWAG models collected: {model.swag.n_models.item()}")
         
         # Save best model and early stopping
         if val_metrics['mae'] < best_val_mae:
             best_val_mae = val_metrics['mae']
             # Create models directory if it doesn't exist
-            torch.save(model.state_dict(), model_path)
+            if args.model_type == 'SWAG':
+                # For SWAG, save the SWAG model (which includes statistics)
+                torch.save(model.state_dict(), model_path)
+            else:
+                torch.save(model.state_dict(), model_path)
             print(f"  → New best model saved to {model_path} (MAE: {best_val_mae:.4f})")
             patience_counter = 0
         else:
@@ -770,22 +796,19 @@ def main():
     # Load best model and fit isotonic recalibrator on validation set
     print("\n" + "="*50)
     print("Final evaluation on test set...")
-    # RandomForest models contain sklearn objects, so we need weights_only=False
-    if args.model_type == 'RandomForest':
-        model.load_state_dict(torch.load(model_path, weights_only=False))
-    else:
-        model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path))
     
     # Compute conformal prediction quantile on validation set
-    print("\nComputing conformal prediction quantile on validation set...")
-    conformal_quantile = compute_conformal_quantile(
-        model, valid_loader, args.device, args.model_type, 
-        expert_indices, coverage=args.conformal_coverage
-    )
-    conformal_path = f'saved_models/best_{args.model_type}_emb_conformal.npz'
-    np.savez(conformal_path, quantile=conformal_quantile, coverage=args.conformal_coverage)
-    print(f"Conformal quantile: {conformal_quantile:.4f} (coverage: {args.conformal_coverage})")
-    print(f"Saved conformal quantile to {conformal_path}")
+    # TEMPORARILY DISABLED - CP removed
+    # print("\nComputing conformal prediction quantile on validation set...")
+    # conformal_quantile = compute_conformal_quantile(
+    #     model, valid_loader, args.device, args.model_type, 
+    #     expert_indices, coverage=args.conformal_coverage
+    # )
+    # conformal_path = f'saved_models/best_{args.model_type}_emb_conformal.npz'
+    # np.savez(conformal_path, quantile=conformal_quantile, coverage=args.conformal_coverage)
+    # print(f"Conformal quantile: {conformal_quantile:.4f} (coverage: {args.conformal_coverage})")
+    # print(f"Saved conformal quantile to {conformal_path}")
     
     iso_model = None
     calibrator_path = f'saved_models/best_{args.model_type}_emb_calibrator.pkl'

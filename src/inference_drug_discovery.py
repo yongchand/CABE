@@ -15,9 +15,11 @@ from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
     DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb,
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
-    DrugDiscoveryRandomForest,
     DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
-    DrugDiscoveryMoNIG_FixedReliability, DrugDiscoveryMoNIG_UniformWeightAggregation
+    DrugDiscoveryMoNIG_NoContextReliability, DrugDiscoveryMoNIG_UniformWeightAggregation,
+    DrugDiscoverySoftmaxMoE,
+    DrugDiscoveryDeepEnsembleMVE,
+    DrugDiscoveryCFGP, DrugDiscoverySWAG
 )
 from src.utils import moe_nig
 
@@ -55,8 +57,9 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+    # Set deterministic behavior for cuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def aggregate_nigs(nigs):
@@ -206,17 +209,21 @@ def inference_monig(model, loader, device, conformal_quantile=None):
                 result['MoNIG_Std'] = total_std
                 
                 # Conformal prediction intervals
-                if conformal_quantile is not None:
-                    lower, upper = get_conformal_intervals(
-                        mu_agg[i, 0], total_std, conformal_quantile
-                    )
-                    result['Conformal_Lower'] = lower
-                    result['Conformal_Upper'] = upper
-                    result['Conformal_Width'] = upper - lower
-                else:
-                    result['Conformal_Lower'] = np.nan
-                    result['Conformal_Upper'] = np.nan
-                    result['Conformal_Width'] = np.nan
+                # TEMPORARILY DISABLED - CP removed
+                # if conformal_quantile is not None:
+                #     lower, upper = get_conformal_intervals(
+                #         mu_agg[i, 0], total_std, conformal_quantile
+                #     )
+                #     result['Conformal_Lower'] = lower
+                #     result['Conformal_Upper'] = upper
+                #     result['Conformal_Width'] = upper - lower
+                # else:
+                #     result['Conformal_Lower'] = np.nan
+                #     result['Conformal_Upper'] = np.nan
+                #     result['Conformal_Width'] = np.nan
+                result['Conformal_Lower'] = np.nan
+                result['Conformal_Upper'] = np.nan
+                result['Conformal_Width'] = np.nan
                 
                 results.append(result)
     
@@ -244,7 +251,7 @@ def inference_general(model, loader, device, model_type, conformal_quantile=None
             embeddings = embeddings.to(device)
             labels = labels.cpu().numpy()
             
-            if model_type in ['DeepEnsemble', 'MCDropout', 'RandomForest']:
+            if model_type in ['DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
                 mu, std = model(expert_scores, embeddings)
                 predictions = mu.cpu().numpy()
                 uncertainties = std.cpu().numpy()
@@ -273,17 +280,21 @@ def inference_general(model, loader, device, model_type, conformal_quantile=None
                 }
                 
                 # Conformal prediction intervals
-                if conformal_quantile is not None:
-                    lower, upper = get_conformal_intervals(
-                        predictions[i, 0], uncertainties[i, 0], conformal_quantile
-                    )
-                    result['Conformal_Lower'] = lower
-                    result['Conformal_Upper'] = upper
-                    result['Conformal_Width'] = upper - lower
-                else:
-                    result['Conformal_Lower'] = np.nan
-                    result['Conformal_Upper'] = np.nan
-                    result['Conformal_Width'] = np.nan
+                # TEMPORARILY DISABLED - CP removed
+                # if conformal_quantile is not None:
+                #     lower, upper = get_conformal_intervals(
+                #         predictions[i, 0], uncertainties[i, 0], conformal_quantile
+                #     )
+                #     result['Conformal_Lower'] = lower
+                #     result['Conformal_Upper'] = upper
+                #     result['Conformal_Width'] = upper - lower
+                # else:
+                #     result['Conformal_Lower'] = np.nan
+                #     result['Conformal_Upper'] = np.nan
+                #     result['Conformal_Width'] = np.nan
+                result['Conformal_Lower'] = np.nan
+                result['Conformal_Upper'] = np.nan
+                result['Conformal_Width'] = np.nan
                 
                 results.append(result)
     
@@ -315,7 +326,8 @@ def main():
     
     # Model config (must match training)
     parser.add_argument('--model_type', type=str, default=None,
-                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest'],
+                       choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
+                                'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
                        help='Model type (auto-detected from model_path if not provided)')
     parser.add_argument('--hidden_dim', type=int, default=256,
                        help='Hidden dimension (must match training)')
@@ -325,10 +337,12 @@ def main():
                        help='Number of models in ensemble (for DeepEnsemble, must match training)')
     parser.add_argument('--num_mc_samples', type=int, default=50,
                        help='Number of MC samples for MCDropout')
-    parser.add_argument('--n_estimators', type=int, default=100,
-                       help='Number of trees for RandomForest (must match training)')
-    parser.add_argument('--max_depth', type=int, default=20,
-                       help='Max depth for RandomForest (must match training)')
+    parser.add_argument('--num_inducing', type=int, default=128,
+                       help='Number of inducing points for CFGP (must match training)')
+    parser.add_argument('--max_num_models', type=int, default=20,
+                       help='Maximum number of models for SWAG (must match training)')
+    parser.add_argument('--num_swag_samples', type=int, default=30,
+                       help='Number of SWAG samples for inference (default: 30)')
     
     # Reproducibility
     parser.add_argument('--seed', type=int, default=42,
@@ -387,20 +401,22 @@ def main():
     print(f"Loaded normalization stats from {norm_stats_path}")
     
     # Load conformal quantile
-    if args.conformal_path is not None:
-        conformal_path = args.conformal_path
-    else:
-        base, _ = os.path.splitext(args.model_path)
-        conformal_path = base + '_conformal.npz'
-    
+    # TEMPORARILY DISABLED - CP removed
+    # if args.conformal_path is not None:
+    #     conformal_path = args.conformal_path
+    # else:
+    #     base, _ = os.path.splitext(args.model_path)
+    #     conformal_path = base + '_conformal.npz'
+    # 
+    # conformal_quantile = None
+    # if os.path.exists(conformal_path):
+    #     conformal_npz = np.load(conformal_path)
+    #     conformal_quantile = float(conformal_npz['quantile'])
+    #     conformal_coverage = float(conformal_npz.get('coverage', 0.95))
+    #     print(f"Loaded conformal quantile: {conformal_quantile:.4f} (coverage: {conformal_coverage})")
+    # else:
+    #     print(f"Warning: Conformal quantile not found at {conformal_path}. Inference will proceed without conformal intervals.")
     conformal_quantile = None
-    if os.path.exists(conformal_path):
-        conformal_npz = np.load(conformal_path)
-        conformal_quantile = float(conformal_npz['quantile'])
-        conformal_coverage = float(conformal_npz.get('coverage', 0.95))
-        print(f"Loaded conformal quantile: {conformal_quantile:.4f} (coverage: {conformal_coverage})")
-    else:
-        print(f"Warning: Conformal quantile not found at {conformal_path}. Inference will proceed without conformal intervals.")
     
     # Load dataset
     print(f"\nLoading {args.split} dataset...")
@@ -421,7 +437,26 @@ def main():
     # Auto-detect model type from model_path if not provided
     if args.model_type is None:
         model_name = os.path.basename(args.model_path)
-        if 'MoNIG' in model_name:
+        # Check for MoNIG variants first (before generic MoNIG, since 'MoNIG' matches all variants)
+        if 'MoNIG_NoReliabilityScaling' in model_name:
+            args.model_type = 'MoNIG_NoReliabilityScaling'
+        elif 'MoNIG_UniformReliability' in model_name:
+            args.model_type = 'MoNIG_UniformReliability'
+        elif 'MoNIG_NoContextReliability' in model_name:
+            args.model_type = 'MoNIG_NoContextReliability'
+        elif 'MoNIG_UniformWeightAggregation' in model_name:
+            args.model_type = 'MoNIG_UniformWeightAggregation'
+        elif 'MoNIG_FixedReliability' in model_name:
+            args.model_type = 'MoNIG_FixedReliability'
+        elif 'SoftmaxMoE' in model_name:
+            args.model_type = 'SoftmaxMoE'
+        elif 'DeepEnsembleMVE' in model_name:
+            args.model_type = 'DeepEnsembleMVE'
+        elif 'CFGP' in model_name:
+            args.model_type = 'CFGP'
+        elif 'SWAG' in model_name:
+            args.model_type = 'SWAG'
+        elif 'MoNIG' in model_name:
             args.model_type = 'MoNIG'
         elif 'NIG' in model_name:
             args.model_type = 'NIG'
@@ -431,8 +466,6 @@ def main():
             args.model_type = 'DeepEnsemble'
         elif 'MCDropout' in model_name:
             args.model_type = 'MCDropout'
-        elif 'RandomForest' in model_name:
-            args.model_type = 'RandomForest'
         else:
             args.model_type = 'Baseline'
         print(f"Auto-detected model type: {args.model_type}")
@@ -445,6 +478,14 @@ def main():
     
     if args.model_type == 'MoNIG':
         model = DrugDiscoveryMoNIGEmb(hyp_params)
+    elif args.model_type == 'MoNIG_NoReliabilityScaling':
+        model = DrugDiscoveryMoNIG_NoReliabilityScaling(hyp_params)
+    elif args.model_type == 'MoNIG_UniformReliability':
+        model = DrugDiscoveryMoNIG_UniformReliability(hyp_params)
+    elif args.model_type == 'MoNIG_NoContextReliability':
+        model = DrugDiscoveryMoNIG_NoContextReliability(hyp_params)
+    elif args.model_type == 'MoNIG_UniformWeightAggregation':
+        model = DrugDiscoveryMoNIG_UniformWeightAggregation(hyp_params)
     elif args.model_type == 'NIG':
         model = DrugDiscoveryNIGEmb(hyp_params)
     elif args.model_type == 'Gaussian':
@@ -457,27 +498,33 @@ def main():
     elif args.model_type == 'MCDropout':
         hyp_params.num_mc_samples = args.num_mc_samples
         model = DrugDiscoveryMCDropout(hyp_params)
-    elif args.model_type == 'RandomForest':
-        hyp_params.n_estimators = args.n_estimators
-        hyp_params.max_depth = getattr(args, 'max_depth', 20)  # Default is 20
-        hyp_params.min_samples_split = 2
-        hyp_params.min_samples_leaf = 1
-        model = DrugDiscoveryRandomForest(hyp_params)
+    elif args.model_type == 'SoftmaxMoE':
+        model = DrugDiscoverySoftmaxMoE(hyp_params)
+    elif args.model_type == 'DeepEnsembleMVE':
+        hyp_params.num_models = args.num_models
+        model = DrugDiscoveryDeepEnsembleMVE(hyp_params)
+    elif args.model_type == 'CFGP':
+        hyp_params.num_inducing = getattr(args, 'num_inducing', 128)
+        model = DrugDiscoveryCFGP(hyp_params)
+    elif args.model_type == 'SWAG':
+        hyp_params.max_num_models = getattr(args, 'max_num_models', 20)
+        hyp_params.no_cov_mat = True
+        hyp_params.num_swag_samples = getattr(args, 'num_swag_samples', 30)
+        model = DrugDiscoverySWAG(hyp_params)
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
     
-    if args.model_type != 'RandomForest':
-        model = model.to(args.device)
+    model = model.to(args.device)
     
     # Load weights
     print(f"Loading model weights from {args.model_path}...")
-    # RandomForest models contain sklearn objects, so we need weights_only=False
-    if args.model_type == 'RandomForest':
-        model.load_state_dict(torch.load(args.model_path, map_location=args.device, weights_only=False))
+    if args.model_type == 'SWAG':
+        # SWAG models may have special state dict structure
+        state_dict = torch.load(args.model_path, map_location=args.device)
+        model.load_state_dict(state_dict, strict=False)
     else:
         model.load_state_dict(torch.load(args.model_path, map_location=args.device))
-    if args.model_type != 'RandomForest':
-        model = model.to(args.device)
+    model = model.to(args.device)
     print(f"Model loaded successfully!")
     
     # Run inference

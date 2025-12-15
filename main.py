@@ -45,10 +45,11 @@ Examples:
     
     # Model
     train_parser.add_argument('--model_type', type=str, default='MoNIG',
-                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout', 'RandomForest',
+                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
                                       'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
-                                      'MoNIG_FixedReliability', 'MoNIG_UniformWeightAggregation'],
-                             help='Model type (including ablation variants)')
+                                      'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
+                                      'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                             help='Model type (including ablation variants and UQ baselines)')
     train_parser.add_argument('--hidden_dim', type=int, default=256,
                              help='Hidden dimension')
     train_parser.add_argument('--dropout', type=float, default=0.2,
@@ -57,10 +58,18 @@ Examples:
                              help='Number of models in ensemble (for DeepEnsemble)')
     train_parser.add_argument('--num_mc_samples', type=int, default=50,
                              help='Number of MC samples for MCDropout')
-    train_parser.add_argument('--n_estimators', type=int, default=100,
-                             help='Number of trees for RandomForest')
-    train_parser.add_argument('--max_depth', type=int, default=20,
-                             help='Max depth for RandomForest (default: 20)')
+    train_parser.add_argument('--num_inducing', type=int, default=128,
+                             help='Number of inducing points for CFGP (default: 128)')
+    train_parser.add_argument('--max_num_models', type=int, default=20,
+                             help='Maximum number of models for SWAG (default: 20)')
+    train_parser.add_argument('--swag_start', type=int, default=75,
+                             help='Epoch to start collecting SWAG models (default: 75)')
+    train_parser.add_argument('--swag_lr', type=float, default=1e-3,
+                             help='Learning rate for SWAG collection (default: 1e-3)')
+    train_parser.add_argument('--swag_freq', type=int, default=1,
+                             help='Frequency of collecting SWAG models (default: 1, every epoch)')
+    train_parser.add_argument('--num_swag_samples', type=int, default=30,
+                             help='Number of SWAG samples for inference (default: 30)')
     
     # Expert selection
     train_parser.add_argument('--expert1_only', action='store_true',
@@ -121,10 +130,10 @@ Examples:
                              help='Number of models in ensemble (for DeepEnsemble)')
     infer_parser.add_argument('--num_mc_samples', type=int, default=50,
                              help='Number of MC samples for MCDropout')
-    infer_parser.add_argument('--n_estimators', type=int, default=100,
-                             help='Number of trees for RandomForest')
-    infer_parser.add_argument('--max_depth', type=int, default=20,
-                             help='Max depth for RandomForest (default: 20)')
+    infer_parser.add_argument('--num_inducing', type=int, default=128,
+                             help='Number of inducing points for CFGP (default: 128)')
+    infer_parser.add_argument('--num_swag_samples', type=int, default=30,
+                             help='Number of SWAG samples for inference (default: 30)')
     
     # Reproducibility
     infer_parser.add_argument('--seed', type=int, default=42,
@@ -156,7 +165,6 @@ Examples:
             '--dropout', str(args.dropout),
             '--num_models', str(getattr(args, 'num_models', 5)),
             '--num_mc_samples', str(getattr(args, 'num_mc_samples', 50)),
-            '--n_estimators', str(getattr(args, 'n_estimators', 100)),
             '--epochs', str(args.epochs),
             '--lr', str(args.lr),
             '--risk_weight', str(args.risk_weight),
@@ -164,8 +172,6 @@ Examples:
             '--seed', str(args.seed),
             '--device', args.device,
         ]
-        # Add max_depth (has default value of 20)
-        train_args.extend(['--max_depth', str(args.max_depth)])
         if args.expert1_only:
             train_args.append('--expert1_only')
         if args.expert2_only:
@@ -196,8 +202,7 @@ Examples:
             '--dropout', str(args.dropout),
             '--num_models', str(getattr(args, 'num_models', 5)),
             '--num_mc_samples', str(getattr(args, 'num_mc_samples', 50)),
-            '--n_estimators', str(getattr(args, 'n_estimators', 100)),
-            '--max_depth', str(getattr(args, 'max_depth', 20)),
+            '--num_inducing', str(getattr(args, 'num_inducing', 128)),
             '--seed', str(getattr(args, 'seed', 42)),
             '--device', args.device,
         ]

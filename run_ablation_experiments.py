@@ -5,7 +5,7 @@ Run ablation experiments for CABE (MoNIG) to test different components.
 Ablations:
 1. MoNIG_NoReliabilityScaling - Remove reliability scaling (r_j = 1.0) → show MoNIG collapses
 2. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts) → show reliability matters
-3. MoNIG_FixedReliability - Use fixed reliability (r_j = 0.5) → test context-dependent reliability
+3. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence) → test context-dependent reliability
 4. MoNIG_UniformWeightAggregation - Use uniform weight aggregation → test MoNIG aggregation necessity
 5. MoNIG (baseline) - Full MoNIG with learned reliability
 
@@ -36,7 +36,7 @@ ALL_ABLATION_TYPES = [
     'MoNIG',  # Baseline
     'MoNIG_NoReliabilityScaling',
     'MoNIG_UniformReliability',
-    'MoNIG_FixedReliability',
+    'MoNIG_NoContextReliability',
     'MoNIG_UniformWeightAggregation',
 ]
 
@@ -155,6 +155,17 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
                 metrics['test_picp_90'] = picp_90
                 metrics['test_ece'] = ece
                 metrics['test_avg_interval_width_95'] = interval_width_95
+                
+                # Compute CRPS and NLL using uncertainty_toolbox
+                try:
+                    uq_metrics = uct.metrics.get_all_metrics(y_pred, y_std, y_true, verbose=False)
+                    scoring_metrics = uq_metrics.get('scoring_rule', {})
+                    metrics['test_crps'] = scoring_metrics.get('crps', np.nan)
+                    metrics['test_nll'] = scoring_metrics.get('nll', np.nan)
+                except Exception as e:
+                    print(f"    Warning: Could not compute CRPS/NLL: {e}")
+                    metrics['test_crps'] = np.nan
+                    metrics['test_nll'] = np.nan
                 
                 # Conformal prediction metrics if available
                 has_conformal = 'Conformal_Lower' in df.columns and 'Conformal_Upper' in df.columns
@@ -325,6 +336,7 @@ def save_results_to_csv(results, csv_file):
                        'test_mean_total_uncertainty',
                        'test_picp_95', 'test_picp_90', 'test_ece',
                        'test_avg_interval_width_95',
+                       'test_crps', 'test_nll',
                        'test_conformal_picp', 'test_conformal_avg_width',
                        'test_conformal_coverage_error', 'test_samples']
         
@@ -348,6 +360,7 @@ def save_results_to_csv(results, csv_file):
     # Reorder columns for readability
     column_order = ['ablation_type', 'seed', 'success', 'test_samples',
                    'test_mae', 'test_rmse', 'test_corr', 'test_r2',
+                   'test_crps', 'test_nll',
                    'test_picp_95', 'test_picp_90', 'test_ece',
                    'test_avg_interval_width_95',
                    'test_conformal_picp', 'test_conformal_avg_width',
@@ -392,16 +405,48 @@ def save_results_to_csv(results, csv_file):
                 if len(r2_values) > 0:
                     print(f"    R²:   {r2_values.mean():.4f} ± {r2_values.std():.4f} (n={len(r2_values)})")
             
+            # Proper scoring rules
+            if 'test_crps' in ablation_df.columns:
+                crps_values = ablation_df['test_crps'].dropna()
+                if len(crps_values) > 0:
+                    print(f"    CRPS: {crps_values.mean():.4f} ± {crps_values.std():.4f} (n={len(crps_values)})")
+            
+            if 'test_nll' in ablation_df.columns:
+                nll_values = ablation_df['test_nll'].dropna()
+                if len(nll_values) > 0:
+                    print(f"    NLL:  {nll_values.mean():.4f} ± {nll_values.std():.4f} (n={len(nll_values)})")
+            
             # Calibration metrics
             if 'test_picp_95' in ablation_df.columns:
                 picp_values = ablation_df['test_picp_95'].dropna()
                 if len(picp_values) > 0:
                     print(f"    PICP@95%: {picp_values.mean():.4f} ± {picp_values.std():.4f} (n={len(picp_values)})")
             
+            if 'test_picp_90' in ablation_df.columns:
+                picp_90_values = ablation_df['test_picp_90'].dropna()
+                if len(picp_90_values) > 0:
+                    print(f"    PICP@90%: {picp_90_values.mean():.4f} ± {picp_90_values.std():.4f} (n={len(picp_90_values)})")
+            
             if 'test_ece' in ablation_df.columns:
                 ece_values = ablation_df['test_ece'].dropna()
                 if len(ece_values) > 0:
                     print(f"    ECE:  {ece_values.mean():.4f} ± {ece_values.std():.4f} (n={len(ece_values)})")
+            
+            if 'test_avg_interval_width_95' in ablation_df.columns:
+                width_values = ablation_df['test_avg_interval_width_95'].dropna()
+                if len(width_values) > 0:
+                    print(f"    Avg Width@95%: {width_values.mean():.4f} ± {width_values.std():.4f} (n={len(width_values)})")
+            
+            # Conformal prediction metrics
+            if 'test_conformal_picp' in ablation_df.columns:
+                conformal_picp_values = ablation_df['test_conformal_picp'].dropna()
+                if len(conformal_picp_values) > 0:
+                    print(f"    Conformal PICP: {conformal_picp_values.mean():.4f} ± {conformal_picp_values.std():.4f} (n={len(conformal_picp_values)})")
+            
+            if 'test_conformal_avg_width' in ablation_df.columns:
+                conformal_width_values = ablation_df['test_conformal_avg_width'].dropna()
+                if len(conformal_width_values) > 0:
+                    print(f"    Conformal Width: {conformal_width_values.mean():.4f} ± {conformal_width_values.std():.4f} (n={len(conformal_width_values)})")
 
 
 def main():
@@ -413,7 +458,7 @@ Ablation Types:
   1. MoNIG - Baseline (full MoNIG with learned reliability)
   2. MoNIG_NoReliabilityScaling - Remove reliability scaling (r_j = 1.0)
   3. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts)
-  4. MoNIG_FixedReliability - Use fixed reliability (r_j = 0.5)
+  4. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence)
   5. MoNIG_UniformWeightAggregation - Use uniform weight aggregation instead of MoNIG
 
 Examples:
@@ -451,7 +496,7 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.005,
+    parser.add_argument('--risk_weight', type=float, default=0.01,
                        help='Risk regularization weight (for NIG/MoNIG)')
     parser.add_argument('--conformal_coverage', type=float, default=0.95,
                        help='Target coverage for conformal prediction intervals (default: 0.95)')

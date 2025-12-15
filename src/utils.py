@@ -2,6 +2,29 @@ import torch
 import numpy as np
 
 
+def flatten(lst):
+    """
+    Flatten a list of tensors into a single tensor.
+    Used by SWAG for parameter manipulation.
+    """
+    tmp = [i.contiguous().view(-1, 1) for i in lst]
+    return torch.cat(tmp, dim=0)
+
+
+def unflatten_like(vector, likeTensorList):
+    """
+    Unflatten a tensor into a list of tensors with shapes matching likeTensorList.
+    Used by SWAG for parameter manipulation.
+    """
+    outList = []
+    idx = 0
+    for tensor in likeTensorList:
+        n = tensor.numel()
+        outList.append(vector[idx:idx+n].view(tensor.shape))
+        idx += n
+    return outList
+
+
 def moe_nig(u1, la1, alpha1, beta1, u2, la2, alpha2, beta2):
     """
     Mixture of Normal-Inverse Gamma (MoNIG) aggregation
