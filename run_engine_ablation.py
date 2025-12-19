@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Run ablation experiments for CABE (MoNIG) to test different components.
+Run ablation experiments for CABE (MoNIG) with different engine combinations.
 
-Ablations:
-1. MoNIG_NoReliabilityScaling - Remove reliability scaling (r_j = 1.0) → show MoNIG collapses
-2. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts) → show reliability matters
-3. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence) → test context-dependent reliability
-4. MoNIG_UniformWeightAggregation - Use uniform weight aggregation → test MoNIG aggregation necessity
-5. MoNIG (baseline) - Full MoNIG with learned reliability
+Engine Combinations:
+1. MoNIG_2engines_dynamicbind_surfdock - 2 engines: DynamicBind, flowdock (surfdock)
+2. MoNIG_3engines_dynamicbind_surfdock_gnina - 3 engines: DynamicBind, flowdock (surfdock), GNINA
 
 Usage:
-    python run_ablation_experiments.py [--seeds 42 43 44 45 46] [--epochs 150]
+    python run_engine_ablation.py [--seeds 42 43 44 45 46] [--epochs 150]
 """
 
 import argparse
@@ -25,20 +22,25 @@ from datetime import datetime
 from scipy.stats import norm
 import uncertainty_toolbox as uct
 
-# Import helper functions from run_multi_seed_experiments
+# Import helper functions from run_ablation_experiments
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Default seeds for experiments
 DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 
-# All available ablation types
-ALL_ABLATION_TYPES = [
-    'MoNIG',  # Baseline
-    'MoNIG_NoReliabilityScaling',
-    'MoNIG_UniformReliability',
-    'MoNIG_NoContextReliability',
-    'MoNIG_UniformWeightAggregation',
-]
+# Engine combinations
+ENGINE_COMBINATIONS = {
+    'MoNIG_2engines_dynamicbind_surfdock': {
+        'name': 'MoNIG_2engines_dynamicbind_surfdock',
+        'engines': ['DynamicBind', 'flowdock'],
+        'expert_flags': {'expert3_only': True, 'expert4_only': True}
+    },
+    'MoNIG_3engines_dynamicbind_surfdock_gnina': {
+        'name': 'MoNIG_3engines_dynamicbind_surfdock_gnina',
+        'engines': ['DynamicBind', 'flowdock', 'GNINA'],
+        'expert_flags': {'expert1_only': True, 'expert3_only': True, 'expert4_only': True}
+    }
+}
 
 
 def compute_picp(y_pred, y_std, y_true, coverage=0.95):
@@ -58,7 +60,7 @@ def compute_interval_ece(y_pred, y_std, y_true):
     return float(np.mean(np.abs(exp_props - obs_props)))
 
 
-def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_dir):
+def run_test_evaluation(model_type, model_path, norm_stats_path, csv_path, seed, device, output_dir, expert_flags):
     """
     Run inference on test set and extract metrics including PICP, ECE, and interval width.
     
@@ -76,6 +78,7 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         'main.py',
         'infer',
         '--model_path', str(model_path),
+        '--norm_stats_path', str(norm_stats_path),
         '--csv_path', csv_path,
         '--split', 'test',
         '--output_path', str(inference_output),
@@ -83,10 +86,19 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         '--device', device,
     ]
     
+    # Add expert flags to inference command
+    if expert_flags.get('expert1_only'):
+        cmd.append('--expert1_only')
+    if expert_flags.get('expert2_only'):
+        cmd.append('--expert2_only')
+    if expert_flags.get('expert3_only'):
+        cmd.append('--expert3_only')
+    if expert_flags.get('expert4_only'):
+        cmd.append('--expert4_only')
     
     try:
         # Run inference
-        subprocess.run(
+        result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -196,6 +208,11 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
             
     except subprocess.CalledProcessError as e:
         print(f"    Warning: Test evaluation failed: {e}")
+        print(f"    Command: {' '.join(cmd)}")
+        if e.stderr:
+            print(f"    Error output: {e.stderr[:500]}")  # Print first 500 chars of error
+        if e.stdout:
+            print(f"    Stdout: {e.stdout[-500:]}")  # Print last 500 chars of stdout
         return {}
     except Exception as e:
         print(f"    Warning: Error parsing test results: {e}")
@@ -204,28 +221,29 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         return {}
 
 
-def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim, 
+def run_training(combination_name, combination_config, seed, csv_path, epochs, batch_size, hidden_dim, 
                 dropout, lr, risk_weight, device, output_dir):
     """
-    Run training for a specific ablation type and seed.
+    Run training for a specific engine combination and seed.
     
     Returns:
         dict: Results dictionary with success status and output paths
     """
     print(f"\n{'='*80}")
-    print(f"Training {ablation_type} with seed {seed}")
+    print(f"Training {combination_name} with seed {seed}")
+    print(f"Engines: {', '.join(combination_config['engines'])}")
     print(f"{'='*80}")
     
     # Create output directory for this experiment
-    exp_dir = Path(output_dir) / f"{ablation_type}_seed{seed}"
+    exp_dir = Path(output_dir) / f"{combination_name}_seed{seed}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Build command - use ablation type as model_type
+    # Build command - use MoNIG as model_type, with expert flags
     cmd = [
         sys.executable,
         'main.py',
         'train',
-        '--model_type', ablation_type,
+        '--model_type', 'MoNIG',  # Always use MoNIG
         '--csv_path', csv_path,
         '--seed', str(seed),
         '--epochs', str(epochs),
@@ -236,6 +254,17 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
         '--risk_weight', str(risk_weight),
         '--device', device,
     ]
+    
+    # Add expert flags
+    expert_flags = combination_config['expert_flags']
+    if expert_flags.get('expert1_only'):
+        cmd.append('--expert1_only')
+    if expert_flags.get('expert2_only'):
+        cmd.append('--expert2_only')
+    if expert_flags.get('expert3_only'):
+        cmd.append('--expert3_only')
+    if expert_flags.get('expert4_only'):
+        cmd.append('--expert4_only')
     
     # Run training
     log_file = exp_dir / 'training.log'
@@ -250,22 +279,34 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
             )
         
         # Check if model files were created
-        model_path = Path('saved_models') / f'best_{ablation_type}_emb.pt'
-        norm_stats_path = Path('saved_models') / f'best_{ablation_type}_emb_norm_stats.npz'
+        # Note: Models are saved as best_MoNIG_emb.pt regardless of expert flags
+        # So we need to copy them immediately before the next training overwrites them
+        model_path = Path('saved_models') / 'best_MoNIG_emb.pt'
+        norm_stats_path = Path('saved_models') / 'best_MoNIG_emb_norm_stats.npz'
         
         success = model_path.exists() and norm_stats_path.exists()
         
         if success:
-            # Copy model files to experiment directory
+            # Copy model files to experiment directory immediately
+            # Use unique names to avoid conflicts
             import shutil
+            exp_model_path = exp_dir / f'best_{combination_name}_emb.pt'
+            exp_norm_stats_path = exp_dir / f'best_{combination_name}_emb_norm_stats.npz'
+            
             if model_path.exists():
-                shutil.copy(model_path, exp_dir / model_path.name)
+                shutil.copy(model_path, exp_model_path)
             if norm_stats_path.exists():
-                shutil.copy(norm_stats_path, exp_dir / norm_stats_path.name)
+                shutil.copy(norm_stats_path, exp_norm_stats_path)
+            
+            # Update paths to point to copied files for inference
+            model_path = exp_model_path
+            norm_stats_path = exp_norm_stats_path
         
         result = {
             'success': success,
-            'ablation_type': ablation_type,
+            'combination_name': combination_name,
+            'engines': ', '.join(combination_config['engines']),
+            'num_engines': len(combination_config['engines']),
             'seed': seed,
             'log_file': str(log_file),
             'model_path': str(model_path) if success else None,
@@ -275,12 +316,14 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
         # Run test evaluation if training succeeded
         if success:
             test_results = run_test_evaluation(
-                model_type=ablation_type,
+                model_type='MoNIG',
                 model_path=model_path,
+                norm_stats_path=norm_stats_path,
                 csv_path=csv_path,
                 seed=seed,
                 device=device,
-                output_dir=exp_dir
+                output_dir=exp_dir,
+                expert_flags=expert_flags
             )
             result.update(test_results)
         
@@ -289,7 +332,9 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
         print(f"ERROR: Training failed with return code {e.returncode}")
         return {
             'success': False,
-            'ablation_type': ablation_type,
+            'combination_name': combination_name,
+            'engines': ', '.join(combination_config['engines']),
+            'num_engines': len(combination_config['engines']),
             'seed': seed,
             'log_file': str(log_file),
             'error': str(e)
@@ -298,7 +343,7 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
 
 def save_results_to_csv(results, csv_file):
     """
-    Save ablation experiment results to CSV file.
+    Save engine ablation experiment results to CSV file.
     
     Args:
         results: List of result dictionaries
@@ -308,7 +353,9 @@ def save_results_to_csv(results, csv_file):
     rows = []
     for r in results:
         row = {
-            'ablation_type': r['ablation_type'],
+            'combination_name': r['combination_name'],
+            'engines': r.get('engines', ''),
+            'num_engines': r.get('num_engines', 0),
             'seed': r['seed'],
             'success': r['success'],
         }
@@ -341,7 +388,7 @@ def save_results_to_csv(results, csv_file):
     df = pd.DataFrame(rows)
     
     # Reorder columns for readability
-    column_order = ['ablation_type', 'seed', 'success', 'test_samples',
+    column_order = ['combination_name', 'engines', 'num_engines', 'seed', 'success', 'test_samples',
                    'test_mae', 'test_rmse', 'test_corr', 'test_r2',
                    'test_crps', 'test_nll',
                    'test_picp_95', 'test_picp_90', 'test_ece',
@@ -359,105 +406,102 @@ def save_results_to_csv(results, csv_file):
     df.to_csv(csv_file, index=False, encoding='utf-8')
     
     # Print summary statistics
-    print("\nSummary Statistics by Ablation Type:")
+    print("\nSummary Statistics by Engine Combination:")
     successful_results = [r for r in results if r['success']]
     if successful_results:
         successful_df = pd.DataFrame([r for r in successful_results])
         
-        for ablation_type in successful_df['ablation_type'].unique():
-            ablation_df = successful_df[successful_df['ablation_type'] == ablation_type]
-            print(f"\n  {ablation_type}:")
+        for combination_name in successful_df['combination_name'].unique():
+            combination_df = successful_df[successful_df['combination_name'] == combination_name]
+            print(f"\n  {combination_name}:")
             
-            if 'test_mae' in ablation_df.columns:
-                mae_values = ablation_df['test_mae'].dropna()
+            if 'test_mae' in combination_df.columns:
+                mae_values = combination_df['test_mae'].dropna()
                 if len(mae_values) > 0:
                     print(f"    MAE:  {mae_values.mean():.4f} ± {mae_values.std():.4f} (n={len(mae_values)})")
             
-            if 'test_rmse' in ablation_df.columns:
-                rmse_values = ablation_df['test_rmse'].dropna()
+            if 'test_rmse' in combination_df.columns:
+                rmse_values = combination_df['test_rmse'].dropna()
                 if len(rmse_values) > 0:
                     print(f"    RMSE: {rmse_values.mean():.4f} ± {rmse_values.std():.4f} (n={len(rmse_values)})")
             
-            if 'test_corr' in ablation_df.columns:
-                corr_values = ablation_df['test_corr'].dropna()
+            if 'test_corr' in combination_df.columns:
+                corr_values = combination_df['test_corr'].dropna()
                 if len(corr_values) > 0:
                     print(f"    Corr: {corr_values.mean():.4f} ± {corr_values.std():.4f} (n={len(corr_values)})")
             
-            if 'test_r2' in ablation_df.columns:
-                r2_values = ablation_df['test_r2'].dropna()
+            if 'test_r2' in combination_df.columns:
+                r2_values = combination_df['test_r2'].dropna()
                 if len(r2_values) > 0:
                     print(f"    R²:   {r2_values.mean():.4f} ± {r2_values.std():.4f} (n={len(r2_values)})")
             
             # Proper scoring rules
-            if 'test_crps' in ablation_df.columns:
-                crps_values = ablation_df['test_crps'].dropna()
+            if 'test_crps' in combination_df.columns:
+                crps_values = combination_df['test_crps'].dropna()
                 if len(crps_values) > 0:
                     print(f"    CRPS: {crps_values.mean():.4f} ± {crps_values.std():.4f} (n={len(crps_values)})")
             
-            if 'test_nll' in ablation_df.columns:
-                nll_values = ablation_df['test_nll'].dropna()
+            if 'test_nll' in combination_df.columns:
+                nll_values = combination_df['test_nll'].dropna()
                 if len(nll_values) > 0:
                     print(f"    NLL:  {nll_values.mean():.4f} ± {nll_values.std():.4f} (n={len(nll_values)})")
             
             # Calibration metrics
-            if 'test_picp_95' in ablation_df.columns:
-                picp_values = ablation_df['test_picp_95'].dropna()
+            if 'test_picp_95' in combination_df.columns:
+                picp_values = combination_df['test_picp_95'].dropna()
                 if len(picp_values) > 0:
                     print(f"    PICP@95%: {picp_values.mean():.4f} ± {picp_values.std():.4f} (n={len(picp_values)})")
             
-            if 'test_picp_90' in ablation_df.columns:
-                picp_90_values = ablation_df['test_picp_90'].dropna()
+            if 'test_picp_90' in combination_df.columns:
+                picp_90_values = combination_df['test_picp_90'].dropna()
                 if len(picp_90_values) > 0:
                     print(f"    PICP@90%: {picp_90_values.mean():.4f} ± {picp_90_values.std():.4f} (n={len(picp_90_values)})")
             
-            if 'test_ece' in ablation_df.columns:
-                ece_values = ablation_df['test_ece'].dropna()
+            if 'test_ece' in combination_df.columns:
+                ece_values = combination_df['test_ece'].dropna()
                 if len(ece_values) > 0:
                     print(f"    ECE:  {ece_values.mean():.4f} ± {ece_values.std():.4f} (n={len(ece_values)})")
             
-            if 'test_avg_interval_width_95' in ablation_df.columns:
-                width_values = ablation_df['test_avg_interval_width_95'].dropna()
+            if 'test_avg_interval_width_95' in combination_df.columns:
+                width_values = combination_df['test_avg_interval_width_95'].dropna()
                 if len(width_values) > 0:
                     print(f"    Avg Width@95%: {width_values.mean():.4f} ± {width_values.std():.4f} (n={len(width_values)})")
             
             # Conformal prediction metrics
-            if 'test_conformal_picp' in ablation_df.columns:
-                conformal_picp_values = ablation_df['test_conformal_picp'].dropna()
+            if 'test_conformal_picp' in combination_df.columns:
+                conformal_picp_values = combination_df['test_conformal_picp'].dropna()
                 if len(conformal_picp_values) > 0:
                     print(f"    Conformal PICP: {conformal_picp_values.mean():.4f} ± {conformal_picp_values.std():.4f} (n={len(conformal_picp_values)})")
             
-            if 'test_conformal_avg_width' in ablation_df.columns:
-                conformal_width_values = ablation_df['test_conformal_avg_width'].dropna()
+            if 'test_conformal_avg_width' in combination_df.columns:
+                conformal_width_values = combination_df['test_conformal_avg_width'].dropna()
                 if len(conformal_width_values) > 0:
                     print(f"    Conformal Width: {conformal_width_values.mean():.4f} ± {conformal_width_values.std():.4f} (n={len(conformal_width_values)})")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run ablation experiments for CABE (MoNIG)',
+        description='Run engine ablation experiments for CABE (MoNIG)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
-Ablation Types:
-  1. MoNIG - Baseline (full MoNIG with learned reliability)
-  2. MoNIG_NoReliabilityScaling - Remove reliability scaling (r_j = 1.0)
-  3. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts)
-  4. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence)
-  5. MoNIG_UniformWeightAggregation - Use uniform weight aggregation instead of MoNIG
+Engine Combinations:
+  1. MoNIG_2engines_dynamicbind_surfdock - 2 engines: DynamicBind, flowdock (surfdock)
+  2. MoNIG_3engines_dynamicbind_surfdock_gnina - 3 engines: DynamicBind, flowdock (surfdock), GNINA
 
 Examples:
-  # Run all ablations with default seeds
-  python run_ablation_experiments.py
+  # Run all engine combinations with default seeds
+  python run_engine_ablation.py
   
-  # Run specific ablations
-  python run_ablation_experiments.py --ablation_types MoNIG_NoReliabilityScaling MoNIG_UniformReliability
+  # Run specific combinations
+  python run_engine_ablation.py --combinations MoNIG_2engines_dynamicbind_surfdock
         """
     )
     
-    # Ablation selection
-    parser.add_argument('--ablation_types', nargs='+', 
-                       choices=ALL_ABLATION_TYPES + ['all'],
+    # Combination selection
+    parser.add_argument('--combinations', nargs='+', 
+                       choices=list(ENGINE_COMBINATIONS.keys()) + ['all'],
                        default=['all'],
-                       help='Ablation types to test (default: all)')
+                       help='Engine combinations to test (default: all)')
     
     # Seeds
     parser.add_argument('--seeds', nargs='+', type=int, default=DEFAULT_SEEDS,
@@ -479,12 +523,12 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.001,
-                       help='Risk regularization weight (for NIG/MoNIG)')
+    parser.add_argument('--risk_weight', type=float, default=0.01,
+                       help='Risk regularization weight (for MoNIG)')
     
     # Output
-    parser.add_argument('--output_dir', type=str, default='experiments_ablation',
-                       help='Output directory for ablation experiment results')
+    parser.add_argument('--output_dir', type=str, default='experiments_engine_ablation',
+                       help='Output directory for engine ablation experiment results')
     
     # Device
     parser.add_argument('--device', type=str, default='cuda' if os.environ.get('CUDA_VISIBLE_DEVICES') else 'cpu',
@@ -492,11 +536,11 @@ Examples:
     
     args = parser.parse_args()
     
-    # Determine which ablations to run
-    if 'all' in args.ablation_types:
-        ablation_types = ALL_ABLATION_TYPES
+    # Determine which combinations to run
+    if 'all' in args.combinations:
+        combinations_to_run = list(ENGINE_COMBINATIONS.keys())
     else:
-        ablation_types = args.ablation_types
+        combinations_to_run = args.combinations
     
     # Validate CSV path
     if not os.path.exists(args.csv_path):
@@ -508,12 +552,12 @@ Examples:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Create summary file
-    summary_file = output_dir / f'ablation_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+    summary_file = output_dir / f'engine_ablation_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
     
     print("="*80)
-    print("CABE ABLATION EXPERIMENT RUNNER")
+    print("CABE ENGINE ABLATION EXPERIMENT RUNNER")
     print("="*80)
-    print(f"Ablation types: {', '.join(ablation_types)}")
+    print(f"Engine combinations: {', '.join(combinations_to_run)}")
     print(f"Seeds: {args.seeds}")
     print(f"Epochs: {args.epochs}")
     print(f"CSV path: {args.csv_path}")
@@ -523,25 +567,27 @@ Examples:
     
     # Run experiments
     all_results = []
-    total_experiments = len(ablation_types) * len(args.seeds)
+    total_experiments = len(combinations_to_run) * len(args.seeds)
     current_experiment = 0
     
-    for ablation_type in ablation_types:
+    for combination_name in combinations_to_run:
+        combination_config = ENGINE_COMBINATIONS[combination_name]
         for seed in args.seeds:
             current_experiment += 1
             print(f"\n[{current_experiment}/{total_experiments}] ", end='')
             
             result = run_training(
-                ablation_type=ablation_type,
+                combination_name=combination_name,
+                combination_config=combination_config,
                 seed=seed,
                 csv_path=args.csv_path,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 hidden_dim=args.hidden_dim,
                 dropout=args.dropout,
-                    lr=args.lr,
-                    risk_weight=args.risk_weight,
-                    device=args.device,
+                lr=args.lr,
+                risk_weight=args.risk_weight,
+                device=args.device,
                 output_dir=output_dir
             )
             
@@ -557,7 +603,7 @@ Examples:
     
     # Print summary
     print("\n" + "="*80)
-    print("ABLATION EXPERIMENT SUMMARY")
+    print("ENGINE ABLATION EXPERIMENT SUMMARY")
     print("="*80)
     
     successful = [r for r in all_results if r['success']]
@@ -570,27 +616,27 @@ Examples:
     if successful:
         print("\nSuccessful experiments:")
         for r in successful:
-            print(f"  {r['ablation_type']} (seed {r['seed']}) -> {r['exp_dir']}")
+            print(f"  {r['combination_name']} (seed {r['seed']}) -> {r['exp_dir']}")
     
     if failed:
         print("\nFailed experiments:")
         for r in failed:
-            print(f"  {r['ablation_type']} (seed {r['seed']})")
+            print(f"  {r['combination_name']} (seed {r['seed']})")
             if 'error' in r:
                 print(f"    Error: {r['error']}")
             print(f"    Log: {r['log_file']}")
     
-    # Summary by ablation type
-    print("\nResults by ablation type:")
-    for ablation_type in ablation_types:
-        ablation_results = [r for r in all_results if r['ablation_type'] == ablation_type]
-        ablation_successful = [r for r in ablation_results if r['success']]
-        print(f"  {ablation_type}: {len(ablation_successful)}/{len(ablation_results)} successful")
+    # Summary by combination
+    print("\nResults by engine combination:")
+    for combination_name in combinations_to_run:
+        combination_results = [r for r in all_results if r['combination_name'] == combination_name]
+        combination_successful = [r for r in combination_results if r['success']]
+        print(f"  {combination_name}: {len(combination_successful)}/{len(combination_results)} successful")
     
     print(f"\n📄 Full results saved to: {summary_file}")
     
     # Save results to CSV
-    csv_file = output_dir / f'ablation_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    csv_file = output_dir / f'engine_ablation_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     save_results_to_csv(all_results, csv_file)
     print(f"CSV results saved to: {csv_file}")
     print("="*80)

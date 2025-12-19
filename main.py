@@ -88,8 +88,6 @@ Examples:
                              help='Learning rate')
     train_parser.add_argument('--risk_weight', type=float, default=0.005,
                              help='Risk regularization weight')
-    train_parser.add_argument('--conformal_coverage', type=float, default=0.95,
-                             help='Target coverage for conformal prediction intervals (default: 0.95)')
     train_parser.add_argument('--seed', type=int, default=42,
                              help='Random seed')
     
@@ -111,8 +109,6 @@ Examples:
                              help='Path to save output CSV')
     infer_parser.add_argument('--norm_stats_path', type=str, default=None,
                              help='Path to normalization stats (.npz). Auto-detected if not provided')
-    infer_parser.add_argument('--conformal_path', type=str, default=None,
-                             help='Path to conformal quantile (.npz). Auto-detected if not provided')
     
     # Data split
     infer_parser.add_argument('--split', type=str, default='test',
@@ -120,6 +116,16 @@ Examples:
                              help='Which split to run inference on')
     infer_parser.add_argument('--batch_size', type=int, default=64,
                              help='Batch size')
+    
+    # Expert selection (must match training)
+    infer_parser.add_argument('--expert1_only', action='store_true',
+                             help='Use only Expert 1 (GNINA) - must match training')
+    infer_parser.add_argument('--expert2_only', action='store_true',
+                             help='Use only Expert 2 (BIND) - must match training')
+    infer_parser.add_argument('--expert3_only', action='store_true',
+                             help='Use only Expert 3 (flowdock) - must match training')
+    infer_parser.add_argument('--expert4_only', action='store_true',
+                             help='Use only Expert 4 (DynamicBind) - must match training')
     
     # Model config (must match training)
     infer_parser.add_argument('--hidden_dim', type=int, default=256,
@@ -168,7 +174,6 @@ Examples:
             '--epochs', str(args.epochs),
             '--lr', str(args.lr),
             '--risk_weight', str(args.risk_weight),
-            '--conformal_coverage', str(args.conformal_coverage),
             '--seed', str(args.seed),
             '--device', args.device,
         ]
@@ -208,8 +213,14 @@ Examples:
         ]
         if args.norm_stats_path:
             infer_args.extend(['--norm_stats_path', args.norm_stats_path])
-        if args.conformal_path:
-            infer_args.extend(['--conformal_path', args.conformal_path])
+        if args.expert1_only:
+            infer_args.append('--expert1_only')
+        if args.expert2_only:
+            infer_args.append('--expert2_only')
+        if args.expert3_only:
+            infer_args.append('--expert3_only')
+        if args.expert4_only:
+            infer_args.append('--expert4_only')
         
         # Temporarily replace sys.argv and call inference_main
         old_argv = sys.argv

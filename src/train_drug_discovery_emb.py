@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import pickle
 import random
 
 # Add parent directory to path to allow imports
@@ -13,8 +12,6 @@ import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-
-import uncertainty_toolbox as uct
 
 from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
@@ -414,70 +411,6 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
     return metrics
     
 
-def collect_predictions_with_uncertainty(model, loader, device, model_type, expert_indices=None):
-    """Return numpy arrays of predictions, stds, and true values for calibration."""
-    if model_type not in ['MoNIG', 'NIG', 'Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'SWAG'] and not model_type.startswith('MoNIG_'):
-        return None, None, None
-    
-    model.eval()
-    preds = []
-    trues = []
-    stds = []
-    eps = 1e-8
-    
-    with torch.no_grad():
-        for inputs, labels, _ in loader:
-            expert_scores, embeddings = inputs
-            if expert_indices is not None and len(expert_indices) < expert_scores.shape[1]:
-                expert_scores = expert_scores[:, expert_indices]
-            expert_scores = expert_scores.to(device)
-            embeddings = embeddings.to(device)
-            labels = labels.to(device).unsqueeze(1)
-            
-            if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
-                nigs = model(expert_scores, embeddings)
-                if model_type == 'MoNIG_UniformWeightAggregation':
-                    mu, v, alpha, beta = nigs[0]
-                else:
-                    mu, v, alpha, beta = aggregate_nigs(nigs)
-                epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
-                total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
-            elif model_type == 'NIG':
-                mu, v, alpha, beta = model(expert_scores, embeddings)
-                epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
-                total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
-            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
-                mu, std = model(expert_scores, embeddings)
-                total_std = std
-            else:
-                # Baseline - no uncertainty
-                mu = model(expert_scores, embeddings)
-                total_std = torch.zeros_like(mu)
-            
-            preds.append(mu.cpu().numpy())
-            stds.append(total_std.cpu().numpy())
-            trues.append(labels.cpu().numpy())
-    
-    if len(preds) == 0:
-        return None, None, None
-    
-    y_pred = np.concatenate(preds, axis=0).flatten()
-    y_std = np.concatenate(stds, axis=0).flatten()
-    y_true = np.concatenate(trues, axis=0).flatten()
-    return y_pred, y_std, y_true
-
-
-def fit_isotonic_interval_calibrator(y_pred, y_std, y_true):
-    """Fit isotonic regression calibrator (interval-based) using uncertainty_toolbox."""
-    if y_pred is None or y_std is None or y_true is None:
-        return None
-    exp_props, obs_props = uct.get_proportion_lists_vectorized(
-        y_pred, y_std, y_true, prop_type='interval'
-    )
-    iso_model = uct.recalibration.iso_recal(exp_props, obs_props)
-    return iso_model
-
-
 def main():
     parser = argparse.ArgumentParser(description='Drug Discovery with MoNIG (Embeddings)')
     
@@ -533,8 +466,6 @@ def main():
                        help='Learning rate')
     parser.add_argument('--risk_weight', type=float, default=0.005,
                        help='Risk regularization weight')
-    parser.add_argument('--conformal_coverage', type=float, default=0.95,
-                       help='Target coverage for conformal prediction intervals (default: 0.95)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     
@@ -793,48 +724,15 @@ def main():
                 print(f"\nEarly stopping triggered after {epoch} epochs")
                 break
     
-    # Load best model and fit isotonic recalibrator on validation set
+    # Load best model for final evaluation
     print("\n" + "="*50)
     print("Final evaluation on test set...")
     model.load_state_dict(torch.load(model_path))
-    
-    # Compute conformal prediction quantile on validation set
-    # TEMPORARILY DISABLED - CP removed
-    # print("\nComputing conformal prediction quantile on validation set...")
-    # conformal_quantile = compute_conformal_quantile(
-    #     model, valid_loader, args.device, args.model_type, 
-    #     expert_indices, coverage=args.conformal_coverage
-    # )
-    # conformal_path = f'saved_models/best_{args.model_type}_emb_conformal.npz'
-    # np.savez(conformal_path, quantile=conformal_quantile, coverage=args.conformal_coverage)
-    # print(f"Conformal quantile: {conformal_quantile:.4f} (coverage: {args.conformal_coverage})")
-    # print(f"Saved conformal quantile to {conformal_path}")
-    
-    iso_model = None
-    calibrator_path = f'saved_models/best_{args.model_type}_emb_calibrator.pkl'
-    if args.model_type in ['MoNIG', 'NIG'] or args.model_type.startswith('MoNIG_'):
-        y_pred_val, y_std_val, y_true_val = collect_predictions_with_uncertainty(
-            model, valid_loader, args.device, args.model_type, expert_indices)
-        try:
-            iso_model = fit_isotonic_interval_calibrator(y_pred_val, y_std_val, y_true_val)
-        except RuntimeError as err:
-            print(f"Warning: isotonic recalibration failed ({err}). Proceeding without it.")
-            iso_model = None
-        if iso_model is not None:
-            with open(calibrator_path, 'wb') as f:
-                pickle.dump({'iso_model': iso_model}, f)
-            print(f"Saved isotonic recalibrator to {calibrator_path}")
-        else:
-            calibrator_path = None
-    else:
-        calibrator_path = None
     
     np.savez(norm_stats_path,
              mean=norm_stats['mean'],
              std=norm_stats['std'])
     print(f"Saved normalization stats to {norm_stats_path}")
-    if calibrator_path:
-        print(f"Calibration artifact: {calibrator_path}")
 
     # Evaluate on test set if it has data
     if len(test_dataset) > 0:

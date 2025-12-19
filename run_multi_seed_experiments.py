@@ -194,7 +194,7 @@ def compute_metrics_from_inference_csv(inference_csv_path, model_type):
     return metrics
 
 
-def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_dir, conformal_path=None):
+def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_dir):
     """
     Run inference on test set and extract metrics including PICP, ECE, and interval width.
     
@@ -219,10 +219,6 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         '--device', device,
     ]
     
-    # Add conformal path if available
-    # TEMPORARILY DISABLED - CP removed
-    # if conformal_path and Path(conformal_path).exists():
-    #     cmd.extend(['--conformal_path', str(conformal_path)])
     
     # Add model-specific arguments
     if model_type == 'DeepEnsemble':
@@ -378,7 +374,7 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
 
 
 def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim, 
-                dropout, lr, risk_weight, conformal_coverage, device, output_dir):
+                dropout, lr, risk_weight, device, output_dir):
     """
     Run training for a specific model type and seed.
     
@@ -407,7 +403,6 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
         '--dropout', str(dropout),
         '--lr', str(lr),
         '--risk_weight', str(risk_weight),
-        '--conformal_coverage', str(conformal_coverage),
         '--device', device,
     ]
     
@@ -446,20 +441,6 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
                 shutil.copy(model_path, exp_dir / model_path.name)
             if norm_stats_path.exists():
                 shutil.copy(norm_stats_path, exp_dir / norm_stats_path.name)
-            
-            # Check for calibrator
-            calibrator_path = Path('saved_models') / f'best_{model_type}_emb_calibrator.pkl'
-            if calibrator_path.exists():
-                shutil.copy(calibrator_path, exp_dir / calibrator_path.name)
-            
-            # Check for conformal quantile file
-            # TEMPORARILY DISABLED - CP removed
-            # conformal_path = Path('saved_models') / f'best_{model_type}_emb_conformal.npz'
-            # conformal_path_exp = None
-            # if conformal_path.exists():
-            #     shutil.copy(conformal_path, exp_dir / conformal_path.name)
-            #     conformal_path_exp = exp_dir / conformal_path.name
-            conformal_path_exp = None
         
         result = {
             'success': success,
@@ -478,8 +459,7 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
                 csv_path=csv_path,
                 seed=seed,
                 device=device,
-                output_dir=exp_dir,
-                conformal_path=None  # TEMPORARILY DISABLED - CP removed
+                output_dir=exp_dir
             )
             result.update(test_results)
         
@@ -540,8 +520,6 @@ Examples:
                        help='Learning rate')
     parser.add_argument('--risk_weight', type=float, default=0.005,
                        help='Risk regularization weight (for NIG/MoNIG)')
-    parser.add_argument('--conformal_coverage', type=float, default=0.95,
-                       help='Target coverage for conformal prediction intervals (default: 0.95)')
     
     # Output
     parser.add_argument('--output_dir', type=str, default='experiments',
@@ -634,7 +612,6 @@ Examples:
                     dropout=args.dropout,
                     lr=args.lr,
                     risk_weight=args.risk_weight,
-                    conformal_coverage=args.conformal_coverage,
                     device=args.device,
                     output_dir=output_dir
                 )

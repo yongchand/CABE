@@ -24,31 +24,6 @@ from src.drug_models_emb import (
 from src.utils import moe_nig
 
 
-def get_conformal_intervals(y_pred, y_std, quantile):
-    """
-    Compute conformal prediction intervals.
-    
-    Args:
-        y_pred: Predictions [n_samples] or [n_samples, 1]
-        y_std: Standard deviations [n_samples] or [n_samples, 1]
-        quantile: Conformal quantile from calibration set
-    
-    Returns:
-        lower: Lower bounds [n_samples]
-        upper: Upper bounds [n_samples]
-    """
-    y_pred = np.asarray(y_pred).flatten()
-    y_std = np.asarray(y_std).flatten()
-    eps = 1e-8
-    
-    # Conformal interval: [y_pred - quantile * y_std, y_pred + quantile * y_std]
-    width = quantile * (y_std + eps)
-    lower = y_pred - width
-    upper = y_pred + width
-    
-    return lower, upper
-
-
 def set_seed(seed):
     """Set random seeds for reproducibility"""
     random.seed(seed)
@@ -78,9 +53,15 @@ def aggregate_nigs(nigs):
     return mu_final, v_final, alpha_final, beta_final
 
 
-def inference_monig(model, loader, device, conformal_quantile=None):
+def inference_monig(model, loader, device, expert_indices=None):
     """
     Run inference and extract detailed per-expert information
+    
+    Args:
+        model: Trained MoNIG model
+        loader: DataLoader
+        device: Device to run on
+        expert_indices: Optional list of expert indices to use (for filtering)
     
     Returns:
         DataFrame with columns:
@@ -101,6 +82,12 @@ def inference_monig(model, loader, device, conformal_quantile=None):
     with torch.no_grad():
         for inputs, labels, complex_ids in loader:
             expert_scores, embeddings = inputs
+            
+            # Filter expert scores if expert_indices is provided
+            # Only filter if we have more experts available than we need
+            if expert_indices is not None and len(expert_indices) > 0 and len(expert_indices) < expert_scores.shape[1]:
+                expert_scores = expert_scores[:, expert_indices]
+            
             expert_scores = expert_scores.to(device)
             embeddings = embeddings.to(device)
             labels = labels.cpu().numpy()
@@ -208,31 +195,21 @@ def inference_monig(model, loader, device, conformal_quantile=None):
                 result['MoNIG_Aleatoric'] = aleatoric_val
                 result['MoNIG_Std'] = total_std
                 
-                # Conformal prediction intervals
-                # TEMPORARILY DISABLED - CP removed
-                # if conformal_quantile is not None:
-                #     lower, upper = get_conformal_intervals(
-                #         mu_agg[i, 0], total_std, conformal_quantile
-                #     )
-                #     result['Conformal_Lower'] = lower
-                #     result['Conformal_Upper'] = upper
-                #     result['Conformal_Width'] = upper - lower
-                # else:
-                #     result['Conformal_Lower'] = np.nan
-                #     result['Conformal_Upper'] = np.nan
-                #     result['Conformal_Width'] = np.nan
-                result['Conformal_Lower'] = np.nan
-                result['Conformal_Upper'] = np.nan
-                result['Conformal_Width'] = np.nan
-                
                 results.append(result)
     
     return pd.DataFrame(results)
 
 
-def inference_general(model, loader, device, model_type, conformal_quantile=None):
+def inference_general(model, loader, device, model_type, expert_indices=None):
     """
     General inference function for non-MoNIG models
+    
+    Args:
+        model: Trained model
+        loader: DataLoader
+        device: Device to run on
+        model_type: Type of model
+        expert_indices: Optional list of expert indices to use (for filtering)
     
     Returns:
         DataFrame with columns:
@@ -247,6 +224,12 @@ def inference_general(model, loader, device, model_type, conformal_quantile=None
     with torch.no_grad():
         for inputs, labels, complex_ids in loader:
             expert_scores, embeddings = inputs
+            
+            # Filter expert scores if expert_indices is provided
+            # Only filter if we have more experts available than we need
+            if expert_indices is not None and len(expert_indices) > 0 and len(expert_indices) < expert_scores.shape[1]:
+                expert_scores = expert_scores[:, expert_indices]
+            
             expert_scores = expert_scores.to(device)
             embeddings = embeddings.to(device)
             labels = labels.cpu().numpy()
@@ -279,23 +262,6 @@ def inference_general(model, loader, device, model_type, conformal_quantile=None
                     'Uncertainty': uncertainties[i, 0],
                 }
                 
-                # Conformal prediction intervals
-                # TEMPORARILY DISABLED - CP removed
-                # if conformal_quantile is not None:
-                #     lower, upper = get_conformal_intervals(
-                #         predictions[i, 0], uncertainties[i, 0], conformal_quantile
-                #     )
-                #     result['Conformal_Lower'] = lower
-                #     result['Conformal_Upper'] = upper
-                #     result['Conformal_Width'] = upper - lower
-                # else:
-                #     result['Conformal_Lower'] = np.nan
-                #     result['Conformal_Upper'] = np.nan
-                #     result['Conformal_Width'] = np.nan
-                result['Conformal_Lower'] = np.nan
-                result['Conformal_Upper'] = np.nan
-                result['Conformal_Width'] = np.nan
-                
                 results.append(result)
     
     return pd.DataFrame(results)
@@ -314,8 +280,6 @@ def main():
                        help='Path to save output CSV (default: test_inference_results.csv)')
     parser.add_argument('--norm_stats_path', type=str, default=None,
                         help='Path to normalization stats (.npz). Defaults to model_path-derived file')
-    parser.add_argument('--conformal_path', type=str, default=None,
-                        help='Path to conformal quantile (.npz). Defaults to model_path-derived file')
     
     # Data split
     parser.add_argument('--split', type=str, default='test',
@@ -343,6 +307,16 @@ def main():
                        help='Maximum number of models for SWAG (must match training)')
     parser.add_argument('--num_swag_samples', type=int, default=30,
                        help='Number of SWAG samples for inference (default: 30)')
+    
+    # Expert selection (must match training)
+    parser.add_argument('--expert1_only', action='store_true',
+                       help='Use only Expert 1 (GNINA) - must match training')
+    parser.add_argument('--expert2_only', action='store_true',
+                       help='Use only Expert 2 (BIND) - must match training')
+    parser.add_argument('--expert3_only', action='store_true',
+                       help='Use only Expert 3 (flowdock) - must match training')
+    parser.add_argument('--expert4_only', action='store_true',
+                       help='Use only Expert 4 (DynamicBind) - must match training')
     
     # Reproducibility
     parser.add_argument('--seed', type=int, default=42,
@@ -400,24 +374,6 @@ def main():
     norm_stats = {'mean': norm_stats_npz['mean'], 'std': norm_stats_npz['std']}
     print(f"Loaded normalization stats from {norm_stats_path}")
     
-    # Load conformal quantile
-    # TEMPORARILY DISABLED - CP removed
-    # if args.conformal_path is not None:
-    #     conformal_path = args.conformal_path
-    # else:
-    #     base, _ = os.path.splitext(args.model_path)
-    #     conformal_path = base + '_conformal.npz'
-    # 
-    # conformal_quantile = None
-    # if os.path.exists(conformal_path):
-    #     conformal_npz = np.load(conformal_path)
-    #     conformal_quantile = float(conformal_npz['quantile'])
-    #     conformal_coverage = float(conformal_npz.get('coverage', 0.95))
-    #     print(f"Loaded conformal quantile: {conformal_quantile:.4f} (coverage: {conformal_coverage})")
-    # else:
-    #     print(f"Warning: Conformal quantile not found at {conformal_path}. Inference will proceed without conformal intervals.")
-    conformal_quantile = None
-    
     # Load dataset
     print(f"\nLoading {args.split} dataset...")
     dataset = DrugDiscoveryDatasetEmb(
@@ -426,8 +382,24 @@ def main():
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     
     # Get dimensions
-    embedding_dim, num_experts = dataset.get_dim()
-    print(f"Embeddings: {embedding_dim}, Experts: {num_experts}")
+    embedding_dim, num_experts_available = dataset.get_dim()
+    print(f"Embeddings: {embedding_dim}, Experts (available): {num_experts_available}")
+    
+    # Determine which experts to use (must match training)
+    expert_flags = [args.expert1_only, args.expert2_only, args.expert3_only, args.expert4_only]
+    expert_names = ['GNINA', 'BIND', 'flowdock', 'DynamicBind']
+    
+    if sum(expert_flags) == 0:
+        # Use all experts (default)
+        expert_indices = list(range(num_experts_available))
+        actual_num_experts = num_experts_available
+        print(f"Using all {num_experts_available} experts")
+    else:
+        # Use selected experts
+        expert_indices = [i for i, flag in enumerate(expert_flags) if flag]
+        actual_num_experts = len(expert_indices)
+        selected_names = [expert_names[i] for i in expert_indices]
+        print(f"Using {actual_num_experts} experts: {', '.join(selected_names)}")
     
     # Create model
     print("\nCreating model...")
@@ -471,10 +443,11 @@ def main():
         print(f"Auto-detected model type: {args.model_type}")
     
     hyp_params = HyperParams()
-    hyp_params.num_experts = num_experts
+    hyp_params.num_experts = actual_num_experts  # Use actual number of experts, not available
     hyp_params.embedding_dim = embedding_dim
     hyp_params.hidden_dim = args.hidden_dim
     hyp_params.dropout = args.dropout
+    hyp_params.expert_indices = expert_indices  # Store expert indices for filtering
     
     if args.model_type == 'MoNIG':
         model = DrugDiscoveryMoNIGEmb(hyp_params)
@@ -518,22 +491,35 @@ def main():
     
     # Load weights
     print(f"Loading model weights from {args.model_path}...")
-    if args.model_type == 'SWAG':
-        # SWAG models may have special state dict structure
-        state_dict = torch.load(args.model_path, map_location=args.device)
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        model.load_state_dict(torch.load(args.model_path, map_location=args.device))
-    model = model.to(args.device)
-    print(f"Model loaded successfully!")
+    try:
+        if args.model_type == 'SWAG':
+            # SWAG models may have special state dict structure
+            state_dict = torch.load(args.model_path, map_location=args.device)
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            state_dict = torch.load(args.model_path, map_location=args.device)
+            # Try strict loading first, fall back to non-strict if it fails
+            try:
+                model.load_state_dict(state_dict, strict=True)
+            except RuntimeError as e:
+                print(f"Warning: Strict loading failed: {e}")
+                print("Attempting non-strict loading...")
+                model.load_state_dict(state_dict, strict=False)
+        model = model.to(args.device)
+        print(f"Model loaded successfully!")
+    except Exception as e:
+        print(f"ERROR: Failed to load model weights: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     
     # Run inference
     print("\nRunning inference...")
     if args.model_type == 'MoNIG' or args.model_type.startswith('MoNIG_'):
-        df_results = inference_monig(model, loader, args.device, conformal_quantile=conformal_quantile)
+        df_results = inference_monig(model, loader, args.device, expert_indices=expert_indices)
     else:
         # General inference for other models
-        df_results = inference_general(model, loader, args.device, args.model_type, conformal_quantile=conformal_quantile)
+        df_results = inference_general(model, loader, args.device, args.model_type, expert_indices=expert_indices)
     
     # Save results
     print(f"\nSaving results to {args.output_path}...")
@@ -551,25 +537,25 @@ def main():
         print(f"  MoNIG MAE:  {np.mean(np.abs(df_results['MoNIG_Prediction'] - df_results['True_Affinity'])):.4f}")
         
         # Print per-expert MAE dynamically
-        for j in range(num_experts):
+        for j in range(actual_num_experts):
             expert_num = j + 1
             expert_mae = np.mean(np.abs(df_results[f'Expert{expert_num}_Prediction'] - df_results['True_Affinity']))
             print(f"  Expert{expert_num} MAE: {expert_mae:.4f}")
         
         print(f"\nExpert Confidence:")
-        for j in range(num_experts):
+        for j in range(actual_num_experts):
             expert_num = j + 1
             avg_nu = df_results[f'Expert{expert_num}_Confidence_nu'].mean()
             print(f"  Expert{expert_num} avg ν: {avg_nu:.2f}")
         
         print(f"\nExpert Weights:")
-        for j in range(num_experts):
+        for j in range(actual_num_experts):
             expert_num = j + 1
             avg_weight = df_results[f'Expert{expert_num}_Weight'].mean()
             print(f"  Expert{expert_num} avg weight: {avg_weight:.3f}")
         
         print(f"\nExpert Trust Distribution:")
-        for j in range(num_experts):
+        for j in range(actual_num_experts):
             expert_num = j + 1
             count = (df_results['More_Confident_Expert'] == expert_num).sum()
             percentage = count / len(df_results) * 100
@@ -582,14 +568,19 @@ def main():
         # Highlight interesting cases
         print(f"\nInteresting Cases:")
         high_disagreement = df_results.nlargest(5, 'Expert_Disagreement')
+        # Build column list dynamically based on number of experts
+        expert_pred_cols = [f'Expert{j+1}_Prediction' for j in range(actual_num_experts)]
         print(f"\nTop 5 samples with highest expert disagreement:")
-        print(high_disagreement[['ComplexID', 'Expert1_Prediction', 'Expert2_Prediction', 
-                                 'Expert_Disagreement', 'MoNIG_Prediction', 'True_Affinity']].to_string(index=False))
+        cols_to_show = ['ComplexID'] + expert_pred_cols + ['Expert_Disagreement', 'MoNIG_Prediction', 'True_Affinity']
+        cols_to_show = [c for c in cols_to_show if c in high_disagreement.columns]
+        print(high_disagreement[cols_to_show].to_string(index=False))
         
         high_conf_diff = df_results.nlargest(5, 'Confidence_Ratio')
         print(f"\nTop 5 samples with highest confidence difference:")
-        print(high_conf_diff[['ComplexID', 'More_Confident_Expert', 'Confidence_Ratio',
-                              'Expert1_Weight', 'Expert2_Weight', 'MoNIG_Prediction']].to_string(index=False))
+        expert_weight_cols = [f'Expert{j+1}_Weight' for j in range(actual_num_experts)]
+        cols_to_show = ['ComplexID', 'More_Confident_Expert', 'Confidence_Ratio'] + expert_weight_cols + ['MoNIG_Prediction']
+        cols_to_show = [c for c in cols_to_show if c in high_conf_diff.columns]
+        print(high_conf_diff[cols_to_show].to_string(index=False))
     else:
         # General model statistics
         pred_col = 'Prediction' if 'Prediction' in df_results.columns else 'MoNIG_Prediction'
