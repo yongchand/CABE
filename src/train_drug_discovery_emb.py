@@ -12,6 +12,7 @@ import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from scipy.optimize import minimize
 
 from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
@@ -212,12 +213,197 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+class LBFGSBOptimizer:
+    """
+    L-BFGS-B optimizer wrapper for PyTorch models using scipy.optimize.minimize
+    More memory efficient than SLSQP, better for large neural networks
+    """
+    def __init__(self, params, lr=1e-3, maxiter=20):
+        self.params = list(params)
+        self.lr = lr
+        self.maxiter = maxiter
+        self.state = {}
+        
+    def zero_grad(self):
+        """Zero out gradients (compatible with PyTorch optimizer API)"""
+        for p in self.params:
+            if p.grad is not None:
+                p.grad.zero_()
+    
+    def step_closure(self, closure):
+        """
+        Perform optimization step using L-BFGS-B
+        Args:
+            closure: A callable that reevaluates the model and returns the loss
+        """
+        # Get initial parameters as flat numpy array
+        x0 = torch.cat([p.data.flatten() for p in self.params]).detach().cpu().numpy().copy()
+        
+        def objective(x_flat):
+            """Objective function for scipy.optimize"""
+            # Clear gradients first
+            for p in self.params:
+                if p.grad is not None:
+                    p.grad.zero_()
+            
+            # Update model parameters
+            offset = 0
+            for p in self.params:
+                numel = p.numel()
+                # Create new tensor to avoid in-place modification issues
+                new_data = torch.from_numpy(x_flat[offset:offset+numel].copy()).reshape(p.shape).to(p.device, dtype=p.dtype)
+                p.data.copy_(new_data)
+                offset += numel
+            
+            # Compute loss
+            loss = closure()
+            
+            # Get gradients (ensure all parameters have gradients)
+            grad_list = []
+            for p in self.params:
+                if p.grad is not None:
+                    grad_list.append(p.grad.flatten())
+                else:
+                    grad_list.append(torch.zeros_like(p.data.flatten()))
+            grad = torch.cat(grad_list).detach().cpu().numpy().copy()
+            
+            loss_val = float(loss.item())
+            
+            # Clean up to prevent memory leaks
+            del loss
+            
+            return loss_val, grad
+        
+        # Run L-BFGS-B optimization
+        try:
+            result = minimize(
+                objective,
+                x0,
+                method='L-BFGS-B',
+                jac=True,  # We provide gradients
+                options={'maxiter': self.maxiter, 'ftol': 1e-9, 'gtol': 1e-5, 'maxcor': 10}
+            )
+            
+            # Update parameters with optimized values
+            offset = 0
+            for p in self.params:
+                numel = p.numel()
+                new_data = torch.from_numpy(result.x[offset:offset+numel].copy()).reshape(p.shape).to(p.device, dtype=p.dtype)
+                p.data.copy_(new_data)
+                offset += numel
+            
+            return result.fun
+        except Exception as e:
+            print(f"Warning: L-BFGS-B optimization failed: {e}")
+            # Return the initial loss if optimization fails
+            for p in self.params:
+                if p.grad is not None:
+                    p.grad.zero_()
+            loss = closure()
+            return loss.item()
+    
+    def step(self):
+        """Standard step (for compatibility, does nothing - use step_closure instead)"""
+        pass
+    
+    @property
+    def param_groups(self):
+        """Return param groups for compatibility with schedulers"""
+        return [{'params': self.params, 'lr': self.lr}]
+
+
+def compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight):
+    """
+    Compute loss for given model and inputs (factored out for SLSQP closure)
+    """
+    if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
+        # Get per-expert NIGs
+        nigs = model(expert_scores, embeddings)
+        
+        # For UniformWeightAggregation, nigs is already aggregated (single element)
+        if model_type == 'MoNIG_UniformWeightAggregation':
+            # Already aggregated, use directly
+            mu_final, v_final, alpha_final, beta_final = nigs[0]
+            loss = criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
+        else:
+            # Aggregate NIGs
+            mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
+            
+            # Compute loss for each expert + aggregated
+            loss = 0
+            for mu, v, alpha, beta in nigs:
+                loss += criterion_nig(mu, v, alpha, beta, labels, risk_weight)
+            loss += criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
+            loss = loss / (len(nigs) + 1)  # Average
+        
+    elif model_type == 'NIG':
+        # Single NIG
+        mu, v, alpha, beta = model(expert_scores, embeddings)
+        loss = criterion_nig(mu, v, alpha, beta, labels, risk_weight)
+        
+    elif model_type == 'Gaussian':
+        # Gaussian with uncertainty
+        mu, sigma = model(expert_scores, embeddings)
+        loss = criterion_gaussian(mu, sigma, labels)
+        
+    elif model_type == 'DeepEnsemble':
+        # Deep Ensemble: train each model separately
+        loss = 0
+        for ensemble_model in model.models:
+            predictions = ensemble_model(expert_scores, embeddings)
+            loss += torch.nn.functional.mse_loss(predictions, labels)
+        loss = loss / len(model.models)
+        
+    elif model_type == 'MCDropout':
+        # MC Dropout: single prediction (dropout handled in forward)
+        # Concatenate inputs for the Sequential model
+        x = torch.cat([expert_scores, embeddings], dim=1)
+        predictions = model.model(x)
+        loss = torch.nn.functional.mse_loss(predictions, labels)
+    
+    elif model_type == 'SWAG':
+        # SWAG: train base model normally, collect snapshots later
+        # Use the base model inside SWAG for training
+        mu, sigma = model.base_model(expert_scores, embeddings)
+        loss = criterion_gaussian(mu, sigma, labels)
+        
+    elif model_type == 'SoftmaxMoE':
+        # Softmax MoE: mean and std prediction
+        mu, std = model(expert_scores, embeddings)
+        # Use Gaussian NLL loss
+        variance = std ** 2
+        loss = criterion_gaussian(mu, variance, labels)
+        
+    elif model_type == 'DeepEnsembleMVE':
+        # Deep Ensemble with MVE
+        mu, std = model(expert_scores, embeddings)
+        # Use Gaussian NLL loss
+        variance = std ** 2
+        loss = criterion_gaussian(mu, variance, labels)
+        
+    elif model_type == 'CFGP':
+        # Convolutional-Fed Gaussian Process
+        mu, std, kl_div = model(expert_scores, embeddings, compute_loss_terms=True)
+        # Negative log-likelihood loss
+        nll_loss = criterion_gaussian(mu, std ** 2, labels)
+        # KL divergence for variational GP (regularization)
+        kl_weight = 0.01  # Weight for KL term
+        loss = nll_loss + kl_weight * kl_div / 1000  # Approximate batch scaling
+        
+    else:  # Baseline
+        predictions = model(expert_scores, embeddings)
+        loss = torch.nn.functional.mse_loss(predictions, labels)
+    
+    return loss
+
+
 def train_epoch(model, loader, optimizer, device, model_type, risk_weight, expert_indices=None):
     """
     Train for one epoch
     """
     model.train()
     total_loss = 0
+    is_lbfgs = isinstance(optimizer, LBFGSBOptimizer)
     
     for batch_idx, (inputs, labels, _) in enumerate(loader):
         expert_scores, embeddings = inputs
@@ -231,89 +417,22 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
         embeddings = embeddings.to(device)
         labels = labels.to(device).unsqueeze(1)  # [batch, 1]
         
-        optimizer.zero_grad()
+        # Define closure for L-BFGS-B optimizer
+        def closure():
+            optimizer.zero_grad()
+            return compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
         
-        if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
-            # Get per-expert NIGs
-            nigs = model(expert_scores, embeddings)
-            
-            # For UniformWeightAggregation, nigs is already aggregated (single element)
-            if model_type == 'MoNIG_UniformWeightAggregation':
-                # Already aggregated, use directly
-                mu_final, v_final, alpha_final, beta_final = nigs[0]
-                loss = criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
-            else:
-                # Aggregate NIGs
-                mu_final, v_final, alpha_final, beta_final = aggregate_nigs(nigs)
-                
-                # Compute loss for each expert + aggregated
-                loss = 0
-                for mu, v, alpha, beta in nigs:
-                    loss += criterion_nig(mu, v, alpha, beta, labels, risk_weight)
-                loss += criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
-                loss = loss / (len(nigs) + 1)  # Average
-            
-        elif model_type == 'NIG':
-            # Single NIG
-            mu, v, alpha, beta = model(expert_scores, embeddings)
-            loss = criterion_nig(mu, v, alpha, beta, labels, risk_weight)
-            
-        elif model_type == 'Gaussian':
-            # Gaussian with uncertainty
-            mu, sigma = model(expert_scores, embeddings)
-            loss = criterion_gaussian(mu, sigma, labels)
-            
-        elif model_type == 'DeepEnsemble':
-            # Deep Ensemble: train each model separately
-            loss = 0
-            for ensemble_model in model.models:
-                predictions = ensemble_model(expert_scores, embeddings)
-                loss += torch.nn.functional.mse_loss(predictions, labels)
-            loss = loss / len(model.models)
-            
-        elif model_type == 'MCDropout':
-            # MC Dropout: single prediction (dropout handled in forward)
-            # Concatenate inputs for the Sequential model
-            x = torch.cat([expert_scores, embeddings], dim=1)
-            predictions = model.model(x)
-            loss = torch.nn.functional.mse_loss(predictions, labels)
-        
-        elif model_type == 'SWAG':
-            # SWAG: train base model normally, collect snapshots later
-            # Use the base model inside SWAG for training
-            mu, sigma = model.base_model(expert_scores, embeddings)
-            loss = criterion_gaussian(mu, sigma, labels)
-            
-        elif model_type == 'SoftmaxMoE':
-            # Softmax MoE: mean and std prediction
-            mu, std = model(expert_scores, embeddings)
-            # Use Gaussian NLL loss
-            variance = std ** 2
-            loss = criterion_gaussian(mu, variance, labels)
-            
-        elif model_type == 'DeepEnsembleMVE':
-            # Deep Ensemble with MVE
-            mu, std = model(expert_scores, embeddings)
-            # Use Gaussian NLL loss
-            variance = std ** 2
-            loss = criterion_gaussian(mu, variance, labels)
-            
-        elif model_type == 'CFGP':
-            # Convolutional-Fed Gaussian Process
-            mu, std, kl_div = model(expert_scores, embeddings, compute_loss_terms=True)
-            # Negative log-likelihood loss
-            nll_loss = criterion_gaussian(mu, std ** 2, labels)
-            # KL divergence for variational GP (regularization)
-            kl_weight = 0.01  # Weight for KL term
-            loss = nll_loss + kl_weight * kl_div / len(loader.dataset)  # Scale KL by dataset size
-            
-        else:  # Baseline
-            predictions = model(expert_scores, embeddings)
-            loss = torch.nn.functional.mse_loss(predictions, labels)
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        if is_lbfgs:
+            # L-BFGS-B needs closure
+            loss_val = optimizer.step_closure(closure)
+            loss = torch.tensor(loss_val)
+        else:
+            # Standard optimizers (Adam, SGD, etc.)
+            optimizer.zero_grad()
+            loss = compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         
         total_loss += loss.item()
     
@@ -464,6 +583,10 @@ def main():
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'lbfgs', 'sgd'],
+                       help='Optimizer to use (default: adam)')
+    parser.add_argument('--lbfgs_maxiter', type=int, default=20,
+                       help='Maximum iterations per step for L-BFGS-B optimizer (default: 20)')
     parser.add_argument('--risk_weight', type=float, default=0.005,
                        help='Risk regularization weight')
     parser.add_argument('--seed', type=int, default=42,
@@ -540,13 +663,23 @@ def main():
     valid_dataset = DrugDiscoveryDatasetEmb(
         args.csv_path, split='valid', seed=args.seed, normalization_stats=norm_stats,
         test_pdb_ids=test_pdb_ids)
-    test_dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split='test', seed=args.seed, normalization_stats=norm_stats,
-        test_pdb_ids=test_pdb_ids)
+    
+    # Try to create test dataset, but don't fail if no test samples exist during training
+    try:
+        test_dataset = DrugDiscoveryDatasetEmb(
+            args.csv_path, split='test', seed=args.seed, normalization_stats=norm_stats,
+            test_pdb_ids=test_pdb_ids)
+        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    except ValueError as e:
+        if "No test samples found" in str(e):
+            print("Warning: No test samples found in dataset. Skipping test evaluation during training.")
+            test_dataset = None
+            test_loader = None
+        else:
+            raise
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
     
     # Get dimensions
     embedding_dim, num_experts = train_dataset.get_dim()
@@ -633,15 +766,31 @@ def main():
     if args.model_type == 'SWAG':
         # For SWAG, optimize the base_model (separate from SWAG wrapper's internal base)
         base_model = model.base_model
-        optimizer = optim.Adam(base_model.parameters(), lr=args.lr, weight_decay=1e-5)
-        # SWAG collection uses a separate optimizer with different LR
-        swag_optimizer = optim.Adam(base_model.parameters(), lr=args.swag_lr, weight_decay=1e-5) if hasattr(args, 'swag_lr') else None
+        params = base_model.parameters()
     else:
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
-        swag_optimizer = None
         base_model = None
+        params = model.parameters()
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
+    # Create optimizer based on args.optimizer
+    if args.optimizer.lower() == 'adam':
+        optimizer = optim.Adam(params, lr=args.lr, weight_decay=1e-5)
+    elif args.optimizer.lower() == 'lbfgs':
+        optimizer = LBFGSBOptimizer(params, lr=args.lr, maxiter=args.lbfgs_maxiter)
+    elif args.optimizer.lower() == 'sgd':
+        optimizer = optim.SGD(params, lr=args.lr, weight_decay=1e-5, momentum=0.9)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
+    
+    # SWAG-specific optimizer
+    swag_optimizer = None
+    if args.model_type == 'SWAG' and hasattr(args, 'swag_lr'):
+        swag_optimizer = optim.Adam(base_model.parameters(), lr=args.swag_lr, weight_decay=1e-5)
+    
+    # Scheduler (not used for L-BFGS-B which has its own line search)
+    if args.optimizer.lower() != 'lbfgs':
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
+    else:
+        scheduler = None  # L-BFGS-B doesn't need external scheduler
     
     # Training loop
     print("\nStarting training...")
@@ -662,12 +811,13 @@ def main():
         # Evaluate
         val_metrics = evaluate(model, valid_loader, args.device, args.model_type, expert_indices)
         
-        # Scheduler step
-        old_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_metrics['mae'])
-        new_lr = optimizer.param_groups[0]['lr']
-        if new_lr < old_lr:
-            print(f"  → Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
+        # Scheduler step (if using scheduler)
+        if scheduler is not None:
+            old_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(val_metrics['mae'])
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr < old_lr:
+                print(f"  → Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
         
         # SWAG collection (after swag_start epoch)
         if args.model_type == 'SWAG' and epoch >= args.swag_start and epoch % args.swag_freq == 0:
@@ -735,7 +885,7 @@ def main():
     print(f"Saved normalization stats to {norm_stats_path}")
 
     # Evaluate on test set if it has data
-    if len(test_dataset) > 0:
+    if test_dataset is not None and len(test_dataset) > 0:
         test_metrics = evaluate(model, test_loader, args.device, args.model_type, expert_indices)
         
         print(f"\nTest Results:")

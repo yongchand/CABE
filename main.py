@@ -86,6 +86,11 @@ Examples:
                              help='Number of epochs')
     train_parser.add_argument('--lr', type=float, default=5e-4,
                              help='Learning rate')
+    train_parser.add_argument('--optimizer', type=str, default='adam', 
+                             choices=['adam', 'lbfgs', 'sgd'],
+                             help='Optimizer to use (default: adam)')
+    train_parser.add_argument('--lbfgs_maxiter', type=int, default=20,
+                             help='Maximum iterations per step for L-BFGS-B optimizer (default: 20)')
     train_parser.add_argument('--risk_weight', type=float, default=0.005,
                              help='Risk regularization weight')
     train_parser.add_argument('--seed', type=int, default=42,
@@ -173,6 +178,8 @@ Examples:
             '--num_mc_samples', str(getattr(args, 'num_mc_samples', 50)),
             '--epochs', str(args.epochs),
             '--lr', str(args.lr),
+            '--optimizer', str(getattr(args, 'optimizer', 'adam')),
+            '--lbfgs_maxiter', str(getattr(args, 'lbfgs_maxiter', 20)),
             '--risk_weight', str(args.risk_weight),
             '--seed', str(args.seed),
             '--device', args.device,

@@ -205,7 +205,7 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
 
 
 def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim, 
-                dropout, lr, risk_weight, device, output_dir):
+                dropout, lr, risk_weight, device, output_dir, optimizer='adam', lbfgs_maxiter=20):
     """
     Run training for a specific ablation type and seed.
     
@@ -213,11 +213,11 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
         dict: Results dictionary with success status and output paths
     """
     print(f"\n{'='*80}")
-    print(f"Training {ablation_type} with seed {seed}")
+    print(f"Training {ablation_type} with seed {seed}, optimizer={optimizer}")
     print(f"{'='*80}")
     
     # Create output directory for this experiment
-    exp_dir = Path(output_dir) / f"{ablation_type}_seed{seed}"
+    exp_dir = Path(output_dir) / f"{ablation_type}_seed{seed}_opt{optimizer}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     
     # Build command - use ablation type as model_type
@@ -233,6 +233,8 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
         '--hidden_dim', str(hidden_dim),
         '--dropout', str(dropout),
         '--lr', str(lr),
+        '--optimizer', optimizer,
+        '--lbfgs_maxiter', str(lbfgs_maxiter),
         '--risk_weight', str(risk_weight),
         '--device', device,
     ]
@@ -267,6 +269,7 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
             'success': success,
             'ablation_type': ablation_type,
             'seed': seed,
+            'optimizer': optimizer,
             'log_file': str(log_file),
             'model_path': str(model_path) if success else None,
             'exp_dir': str(exp_dir)
@@ -291,6 +294,7 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
             'success': False,
             'ablation_type': ablation_type,
             'seed': seed,
+            'optimizer': optimizer,
             'log_file': str(log_file),
             'error': str(e)
         }
@@ -310,6 +314,7 @@ def save_results_to_csv(results, csv_file):
         row = {
             'ablation_type': r['ablation_type'],
             'seed': r['seed'],
+            'optimizer': r.get('optimizer', 'adam'),
             'success': r['success'],
         }
         
@@ -341,7 +346,7 @@ def save_results_to_csv(results, csv_file):
     df = pd.DataFrame(rows)
     
     # Reorder columns for readability
-    column_order = ['ablation_type', 'seed', 'success', 'test_samples',
+    column_order = ['ablation_type', 'seed', 'optimizer', 'success', 'test_samples',
                    'test_mae', 'test_rmse', 'test_corr', 'test_r2',
                    'test_crps', 'test_nll',
                    'test_picp_95', 'test_picp_90', 'test_ece',
@@ -479,6 +484,10 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'lbfgs', 'sgd'],
+                       help='Optimizer to use (default: adam)')
+    parser.add_argument('--lbfgs_maxiter', type=int, default=20,
+                       help='Maximum iterations per step for L-BFGS-B optimizer (default: 20)')
     parser.add_argument('--risk_weight', type=float, default=0.001,
                        help='Risk regularization weight (for NIG/MoNIG)')
     
@@ -539,10 +548,12 @@ Examples:
                 batch_size=args.batch_size,
                 hidden_dim=args.hidden_dim,
                 dropout=args.dropout,
-                    lr=args.lr,
-                    risk_weight=args.risk_weight,
-                    device=args.device,
-                output_dir=output_dir
+                lr=args.lr,
+                risk_weight=args.risk_weight,
+                device=args.device,
+                output_dir=output_dir,
+                optimizer=args.optimizer,
+                lbfgs_maxiter=args.lbfgs_maxiter
             )
             
             all_results.append(result)
