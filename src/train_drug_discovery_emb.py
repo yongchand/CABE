@@ -237,70 +237,48 @@ class LBFGSBOptimizer:
             closure: A callable that reevaluates the model and returns the loss
         """
         # Get initial parameters as flat numpy array
-        x0 = torch.cat([p.data.flatten() for p in self.params]).detach().cpu().numpy().copy()
+        x0 = torch.cat([p.data.flatten() for p in self.params]).detach().cpu().numpy()
         
         def objective(x_flat):
             """Objective function for scipy.optimize"""
-            # Clear gradients first
-            for p in self.params:
-                if p.grad is not None:
-                    p.grad.zero_()
-            
             # Update model parameters
             offset = 0
             for p in self.params:
                 numel = p.numel()
-                # Create new tensor to avoid in-place modification issues
-                new_data = torch.from_numpy(x_flat[offset:offset+numel].copy()).reshape(p.shape).to(p.device, dtype=p.dtype)
-                p.data.copy_(new_data)
+                p.data.copy_(torch.from_numpy(x_flat[offset:offset+numel]).reshape(p.shape).to(p.device))
                 offset += numel
+            
+            # Zero gradients
+            for p in self.params:
+                if p.grad is not None:
+                    p.grad.zero_()
             
             # Compute loss
             loss = closure()
             
-            # Get gradients (ensure all parameters have gradients)
-            grad_list = []
-            for p in self.params:
-                if p.grad is not None:
-                    grad_list.append(p.grad.flatten())
-                else:
-                    grad_list.append(torch.zeros_like(p.data.flatten()))
-            grad = torch.cat(grad_list).detach().cpu().numpy().copy()
+            # Get gradients
+            grad = torch.cat([p.grad.flatten() if p.grad is not None else torch.zeros_like(p.data.flatten()) 
+                             for p in self.params]).detach().cpu().numpy()
             
-            loss_val = float(loss.item())
-            
-            # Clean up to prevent memory leaks
-            del loss
-            
-            return loss_val, grad
+            return loss.item(), grad
         
         # Run L-BFGS-B optimization
-        try:
-            result = minimize(
-                objective,
-                x0,
-                method='L-BFGS-B',
-                jac=True,  # We provide gradients
-                options={'maxiter': self.maxiter, 'ftol': 1e-9, 'gtol': 1e-5, 'maxcor': 10}
-            )
-            
-            # Update parameters with optimized values
-            offset = 0
-            for p in self.params:
-                numel = p.numel()
-                new_data = torch.from_numpy(result.x[offset:offset+numel].copy()).reshape(p.shape).to(p.device, dtype=p.dtype)
-                p.data.copy_(new_data)
-                offset += numel
-            
-            return result.fun
-        except Exception as e:
-            print(f"Warning: L-BFGS-B optimization failed: {e}")
-            # Return the initial loss if optimization fails
-            for p in self.params:
-                if p.grad is not None:
-                    p.grad.zero_()
-            loss = closure()
-            return loss.item()
+        result = minimize(
+            objective,
+            x0,
+            method='L-BFGS-B',
+            jac=True,
+            options={'maxiter': self.maxiter, 'ftol': 1e-9, 'gtol': 1e-5}
+        )
+        
+        # Update parameters with optimized values
+        offset = 0
+        for p in self.params:
+            numel = p.numel()
+            p.data.copy_(torch.from_numpy(result.x[offset:offset+numel]).reshape(p.shape).to(p.device))
+            offset += numel
+        
+        return result.fun
     
     def step(self):
         """Standard step (for compatibility, does nothing - use step_closure instead)"""
@@ -419,8 +397,9 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
         
         # Define closure for L-BFGS-B optimizer
         def closure():
-            optimizer.zero_grad()
-            return compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
+            loss = compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
+            loss.backward()
+            return loss
         
         if is_lbfgs:
             # L-BFGS-B needs closure
