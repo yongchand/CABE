@@ -205,7 +205,9 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
 
 
 def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim, 
-                dropout, lr, risk_weight, device, output_dir, optimizer='adam', lbfgs_maxiter=20):
+                dropout, lr, risk_weight, device, output_dir, optimizer='adam', 
+                lbfgs_maxiter=20, lbfgs_history_size=10, lbfgs_ftol=1e-8,
+                lbfgs_gtol=1e-6, lbfgs_maxls=20, lbfgs_maxfun=0):
     """
     Run training for a specific ablation type and seed.
     
@@ -235,6 +237,11 @@ def run_training(ablation_type, seed, csv_path, epochs, batch_size, hidden_dim,
         '--lr', str(lr),
         '--optimizer', optimizer,
         '--lbfgs_maxiter', str(lbfgs_maxiter),
+        '--lbfgs_history_size', str(lbfgs_history_size),
+        '--lbfgs_ftol', str(lbfgs_ftol),
+        '--lbfgs_gtol', str(lbfgs_gtol),
+        '--lbfgs_maxls', str(lbfgs_maxls),
+        '--lbfgs_maxfun', str(lbfgs_maxfun),
         '--risk_weight', str(risk_weight),
         '--device', device,
     ]
@@ -484,10 +491,20 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'lbfgs', 'sgd'],
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'lbfgs', 'lbfgs_torch', 'sgd'],
                        help='Optimizer to use (default: adam)')
     parser.add_argument('--lbfgs_maxiter', type=int, default=20,
-                       help='Maximum iterations per step for L-BFGS-B optimizer (default: 20)')
+                       help='Maximum iterations per step for L-BFGS optimizer (default: 20)')
+    parser.add_argument('--lbfgs_history_size', type=int, default=10,
+                       help='History size for L-BFGS (default: 10)')
+    parser.add_argument('--lbfgs_ftol', type=float, default=1e-8,
+                       help='Function tolerance for L-BFGS-B (default: 1e-8)')
+    parser.add_argument('--lbfgs_gtol', type=float, default=1e-6,
+                       help='Gradient tolerance for L-BFGS-B (default: 1e-6)')
+    parser.add_argument('--lbfgs_maxls', type=int, default=20,
+                       help='Maximum line search steps for L-BFGS-B (default: 20)')
+    parser.add_argument('--lbfgs_maxfun', type=int, default=0,
+                       help='Maximum function evaluations for L-BFGS-B (0=auto maxiter*10)')
     parser.add_argument('--risk_weight', type=float, default=0.001,
                        help='Risk regularization weight (for NIG/MoNIG)')
     
@@ -553,7 +570,12 @@ Examples:
                 device=args.device,
                 output_dir=output_dir,
                 optimizer=args.optimizer,
-                lbfgs_maxiter=args.lbfgs_maxiter
+                lbfgs_maxiter=getattr(args, 'lbfgs_maxiter', 20),
+                lbfgs_history_size=getattr(args, 'lbfgs_history_size', 10),
+                lbfgs_ftol=getattr(args, 'lbfgs_ftol', 1e-8),
+                lbfgs_gtol=getattr(args, 'lbfgs_gtol', 1e-6),
+                lbfgs_maxls=getattr(args, 'lbfgs_maxls', 20),
+                lbfgs_maxfun=getattr(args, 'lbfgs_maxfun', 0),
             )
             
             all_results.append(result)

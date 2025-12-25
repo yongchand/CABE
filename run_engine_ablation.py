@@ -30,15 +30,15 @@ DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 
 # Engine combinations
 ENGINE_COMBINATIONS = {
-    'MoNIG_2engines_dynamicbind_surfdock': {
-        'name': 'MoNIG_2engines_dynamicbind_surfdock',
-        'engines': ['DynamicBind', 'flowdock'],
-        'expert_flags': {'expert3_only': True, 'expert4_only': True}
-    },
+    # 'MoNIG_2engines_dynamicbind_surfdock': {
+    #     'name': 'MoNIG_2engines_dynamicbind_surfdock',
+    #     'engines': ['DynamicBind', 'flowdock'],
+    #     'expert_flags': {'expert3_only': True, 'expert4_only': True}
+    # },
     'MoNIG_3engines_dynamicbind_surfdock_gnina': {
         'name': 'MoNIG_3engines_dynamicbind_surfdock_gnina',
         'engines': ['DynamicBind', 'flowdock', 'GNINA'],
-        'expert_flags': {'expert1_only': True, 'expert3_only': True, 'expert4_only': True}
+        'expert_flags': {'expert2_only': True, 'expert3_only': True, 'expert4_only': True}
     }
 }
 
@@ -222,9 +222,13 @@ def run_test_evaluation(model_type, model_path, norm_stats_path, csv_path, seed,
 
 
 def run_training(combination_name, combination_config, seed, csv_path, epochs, batch_size, hidden_dim, 
-                dropout, lr, risk_weight, device, output_dir):
+                dropout, lr, risk_weight, device, output_dir, optimizer='adam', lbfgs_maxiter=20):
     """
     Run training for a specific engine combination and seed.
+    
+    Args:
+        optimizer: Optimizer to use ('adam', 'lbfgs', 'lbfgs_torch', 'sgd')
+        lbfgs_maxiter: Maximum iterations per L-BFGS step (for lbfgs optimizer)
     
     Returns:
         dict: Results dictionary with success status and output paths
@@ -232,10 +236,13 @@ def run_training(combination_name, combination_config, seed, csv_path, epochs, b
     print(f"\n{'='*80}")
     print(f"Training {combination_name} with seed {seed}")
     print(f"Engines: {', '.join(combination_config['engines'])}")
+    print(f"Optimizer: {optimizer}")
+    if optimizer in ['lbfgs', 'lbfgs_torch']:
+        print(f"L-BFGS maxiter: {lbfgs_maxiter}")
     print(f"{'='*80}")
     
     # Create output directory for this experiment
-    exp_dir = Path(output_dir) / f"{combination_name}_seed{seed}"
+    exp_dir = Path(output_dir) / f"{combination_name}_seed{seed}_opt{optimizer}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     
     # Build command - use MoNIG as model_type, with expert flags
@@ -253,7 +260,12 @@ def run_training(combination_name, combination_config, seed, csv_path, epochs, b
         '--lr', str(lr),
         '--risk_weight', str(risk_weight),
         '--device', device,
+        '--optimizer', optimizer,
     ]
+    
+    # Add L-BFGS specific parameters
+    if optimizer in ['lbfgs', 'lbfgs_torch']:
+        cmd.extend(['--lbfgs_maxiter', str(lbfgs_maxiter)])
     
     # Add expert flags
     expert_flags = combination_config['expert_flags']
@@ -308,6 +320,7 @@ def run_training(combination_name, combination_config, seed, csv_path, epochs, b
             'engines': ', '.join(combination_config['engines']),
             'num_engines': len(combination_config['engines']),
             'seed': seed,
+            'optimizer': optimizer,
             'log_file': str(log_file),
             'model_path': str(model_path) if success else None,
             'exp_dir': str(exp_dir)
@@ -336,6 +349,7 @@ def run_training(combination_name, combination_config, seed, csv_path, epochs, b
             'engines': ', '.join(combination_config['engines']),
             'num_engines': len(combination_config['engines']),
             'seed': seed,
+            'optimizer': optimizer,
             'log_file': str(log_file),
             'error': str(e)
         }
@@ -357,6 +371,7 @@ def save_results_to_csv(results, csv_file):
             'engines': r.get('engines', ''),
             'num_engines': r.get('num_engines', 0),
             'seed': r['seed'],
+            'optimizer': r.get('optimizer', 'adam'),
             'success': r['success'],
         }
         
@@ -388,7 +403,7 @@ def save_results_to_csv(results, csv_file):
     df = pd.DataFrame(rows)
     
     # Reorder columns for readability
-    column_order = ['combination_name', 'engines', 'num_engines', 'seed', 'success', 'test_samples',
+    column_order = ['combination_name', 'engines', 'num_engines', 'seed', 'optimizer', 'success', 'test_samples',
                    'test_mae', 'test_rmse', 'test_corr', 'test_r2',
                    'test_crps', 'test_nll',
                    'test_picp_95', 'test_picp_90', 'test_ece',
@@ -489,11 +504,17 @@ Engine Combinations:
   2. MoNIG_3engines_dynamicbind_surfdock_gnina - 3 engines: DynamicBind, flowdock (surfdock), GNINA
 
 Examples:
-  # Run all engine combinations with default seeds
+  # Run all engine combinations with default seeds (Adam optimizer)
   python run_engine_ablation.py
   
   # Run specific combinations
   python run_engine_ablation.py --combinations MoNIG_2engines_dynamicbind_surfdock
+  
+  # Run with L-BFGS-B optimizer
+  python run_engine_ablation.py --optimizer lbfgs --lbfgs_maxiter 100 --epochs 10
+  
+  # Run with custom seeds and device
+  python run_engine_ablation.py --seeds 42 43 44 --device cuda:0 --optimizer adam
         """
     )
     
@@ -525,6 +546,13 @@ Examples:
                        help='Learning rate')
     parser.add_argument('--risk_weight', type=float, default=0.01,
                        help='Risk regularization weight (for MoNIG)')
+    
+    # Optimizer
+    parser.add_argument('--optimizer', type=str, default='adam',
+                       choices=['adam', 'lbfgs', 'lbfgs_torch', 'sgd'],
+                       help='Optimizer to use (default: adam)')
+    parser.add_argument('--lbfgs_maxiter', type=int, default=20,
+                       help='Maximum iterations per L-BFGS step (default: 20)')
     
     # Output
     parser.add_argument('--output_dir', type=str, default='experiments_engine_ablation',
@@ -560,6 +588,9 @@ Examples:
     print(f"Engine combinations: {', '.join(combinations_to_run)}")
     print(f"Seeds: {args.seeds}")
     print(f"Epochs: {args.epochs}")
+    print(f"Optimizer: {args.optimizer}")
+    if args.optimizer in ['lbfgs', 'lbfgs_torch']:
+        print(f"L-BFGS maxiter: {args.lbfgs_maxiter}")
     print(f"CSV path: {args.csv_path}")
     print(f"Output directory: {output_dir}")
     print(f"Device: {args.device}")
@@ -588,7 +619,9 @@ Examples:
                 lr=args.lr,
                 risk_weight=args.risk_weight,
                 device=args.device,
-                output_dir=output_dir
+                output_dir=output_dir,
+                optimizer=args.optimizer,
+                lbfgs_maxiter=args.lbfgs_maxiter
             )
             
             all_results.append(result)

@@ -215,13 +215,19 @@ def set_seed(seed):
 
 class LBFGSBOptimizer:
     """
-    L-BFGS-B optimizer wrapper for PyTorch models using scipy.optimize.minimize
-    More memory efficient than SLSQP, better for large neural networks
+    L-BFGS-B optimizer wrapper for PyTorch models using scipy.optimize.minimize.
+    Exposes tolerances/history so we can tune convergence vs. runtime.
     """
-    def __init__(self, params, lr=1e-3, maxiter=20):
+    def __init__(self, params, lr=1e-3, maxiter=20, history_size=10,
+                 ftol=1e-8, gtol=1e-6, maxls=20, maxfun=0):
         self.params = list(params)
         self.lr = lr
         self.maxiter = maxiter
+        self.history_size = history_size
+        self.ftol = ftol
+        self.gtol = gtol
+        self.maxls = maxls
+        self.maxfun = maxfun
         self.state = {}
         
     def zero_grad(self):
@@ -238,15 +244,17 @@ class LBFGSBOptimizer:
         """
         # Get initial parameters as flat numpy array
         x0 = torch.cat([p.data.flatten() for p in self.params]).detach().cpu().numpy()
+        effective_maxfun = self.maxfun if self.maxfun and self.maxfun > 0 else self.maxiter * 10
         
         def objective(x_flat):
             """Objective function for scipy.optimize"""
             # Update model parameters
             offset = 0
-            for p in self.params:
-                numel = p.numel()
-                p.data.copy_(torch.from_numpy(x_flat[offset:offset+numel]).reshape(p.shape).to(p.device))
-                offset += numel
+            with torch.no_grad():
+                for p in self.params:
+                    numel = p.numel()
+                    p.data.copy_(torch.from_numpy(x_flat[offset:offset+numel]).reshape(p.shape).to(p.device))
+                    offset += numel
             
             # Zero gradients
             for p in self.params:
@@ -262,21 +270,29 @@ class LBFGSBOptimizer:
             
             return loss.item(), grad
         
-        # Run L-BFGS-B optimization
+        # Run L-BFGS-B optimization with configurable parameters
         result = minimize(
             objective,
             x0,
             method='L-BFGS-B',
             jac=True,
-            options={'maxiter': self.maxiter, 'ftol': 1e-9, 'gtol': 1e-5}
+            options={
+                'maxiter': self.maxiter,
+                'maxfun': effective_maxfun,
+                'ftol': self.ftol,
+                'gtol': self.gtol,
+                'maxcor': self.history_size,
+                'maxls': self.maxls
+            }
         )
         
         # Update parameters with optimized values
         offset = 0
-        for p in self.params:
-            numel = p.numel()
-            p.data.copy_(torch.from_numpy(result.x[offset:offset+numel]).reshape(p.shape).to(p.device))
-            offset += numel
+        with torch.no_grad():
+            for p in self.params:
+                numel = p.numel()
+                p.data.copy_(torch.from_numpy(result.x[offset:offset+numel]).reshape(p.shape).to(p.device))
+                offset += numel
         
         return result.fun
     
@@ -381,7 +397,8 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
     """
     model.train()
     total_loss = 0
-    is_lbfgs = isinstance(optimizer, LBFGSBOptimizer)
+    is_lbfgs_scipy = isinstance(optimizer, LBFGSBOptimizer)
+    is_lbfgs_torch = isinstance(optimizer, optim.LBFGS)
     
     for batch_idx, (inputs, labels, _) in enumerate(loader):
         expert_scores, embeddings = inputs
@@ -395,16 +412,28 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
         embeddings = embeddings.to(device)
         labels = labels.to(device).unsqueeze(1)  # [batch, 1]
         
-        # Define closure for L-BFGS-B optimizer
-        def closure():
-            loss = compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
-            loss.backward()
-            return loss
-        
-        if is_lbfgs:
-            # L-BFGS-B needs closure
+        # Define closure for LBFGS optimizers
+        if is_lbfgs_scipy:
+            # Scipy L-BFGS-B closure
+            def closure():
+                loss = compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
+                loss.backward()
+                return loss
             loss_val = optimizer.step_closure(closure)
             loss = torch.tensor(loss_val)
+        elif is_lbfgs_torch:
+            # PyTorch LBFGS closure with gradient clipping
+            def closure():
+                optimizer.zero_grad()
+                loss = compute_loss(model, expert_scores, embeddings, labels, model_type, risk_weight)
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Warning: NaN/Inf loss detected, skipping batch")
+                    return torch.tensor(0.0, device=device)
+                loss.backward()
+                # Clip gradients inside closure for LBFGS
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                return loss
+            loss = optimizer.step(closure)
         else:
             # Standard optimizers (Adam, SGD, etc.)
             optimizer.zero_grad()
@@ -562,10 +591,20 @@ def main():
                        help='Number of epochs')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'lbfgs', 'sgd'],
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'lbfgs', 'lbfgs_torch', 'sgd'],
                        help='Optimizer to use (default: adam)')
     parser.add_argument('--lbfgs_maxiter', type=int, default=20,
-                       help='Maximum iterations per step for L-BFGS-B optimizer (default: 20)')
+                       help='Maximum iterations per step for L-BFGS optimizer (default: 20)')
+    parser.add_argument('--lbfgs_history_size', type=int, default=10,
+                       help='History size for L-BFGS (default: 10)')
+    parser.add_argument('--lbfgs_ftol', type=float, default=1e-8,
+                       help='Function tolerance for L-BFGS-B (default: 1e-8)')
+    parser.add_argument('--lbfgs_gtol', type=float, default=1e-6,
+                       help='Gradient tolerance for L-BFGS-B (default: 1e-6)')
+    parser.add_argument('--lbfgs_maxls', type=int, default=20,
+                       help='Maximum line search steps for L-BFGS-B (default: 20)')
+    parser.add_argument('--lbfgs_maxfun', type=int, default=0,
+                       help='Maximum function evaluations for L-BFGS-B (0=auto maxiter*10)')
     parser.add_argument('--risk_weight', type=float, default=0.005,
                        help='Risk regularization weight')
     parser.add_argument('--seed', type=int, default=42,
@@ -754,7 +793,23 @@ def main():
     if args.optimizer.lower() == 'adam':
         optimizer = optim.Adam(params, lr=args.lr, weight_decay=1e-5)
     elif args.optimizer.lower() == 'lbfgs':
-        optimizer = LBFGSBOptimizer(params, lr=args.lr, maxiter=args.lbfgs_maxiter)
+        optimizer = LBFGSBOptimizer(
+            params,
+            lr=args.lr,
+            maxiter=args.lbfgs_maxiter,
+            history_size=args.lbfgs_history_size,
+            ftol=args.lbfgs_ftol,
+            gtol=args.lbfgs_gtol,
+            maxls=args.lbfgs_maxls,
+            maxfun=args.lbfgs_maxfun,
+        )
+    elif args.optimizer.lower() == 'lbfgs_torch':
+        # PyTorch native LBFGS - needs larger learning rate than Adam
+        lbfgs_lr = 1.0  # LBFGS typically uses lr=1.0 with line search
+        optimizer = optim.LBFGS(params, lr=lbfgs_lr, max_iter=args.lbfgs_maxiter, 
+                               history_size=args.lbfgs_history_size, 
+                               line_search_fn='strong_wolfe',  # Re-enable line search
+                               tolerance_grad=1e-7, tolerance_change=1e-9)
     elif args.optimizer.lower() == 'sgd':
         optimizer = optim.SGD(params, lr=args.lr, weight_decay=1e-5, momentum=0.9)
     else:
@@ -765,11 +820,11 @@ def main():
     if args.model_type == 'SWAG' and hasattr(args, 'swag_lr'):
         swag_optimizer = optim.Adam(base_model.parameters(), lr=args.swag_lr, weight_decay=1e-5)
     
-    # Scheduler (not used for L-BFGS-B which has its own line search)
-    if args.optimizer.lower() != 'lbfgs':
+    # Scheduler (not used for LBFGS which has its own line search)
+    if args.optimizer.lower() not in ['lbfgs', 'lbfgs_torch']:
         scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
     else:
-        scheduler = None  # L-BFGS-B doesn't need external scheduler
+        scheduler = None  # LBFGS doesn't need external scheduler
     
     # Training loop
     print("\nStarting training...")
@@ -886,4 +941,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -87,10 +87,20 @@ Examples:
     train_parser.add_argument('--lr', type=float, default=5e-4,
                              help='Learning rate')
     train_parser.add_argument('--optimizer', type=str, default='adam', 
-                             choices=['adam', 'lbfgs', 'sgd'],
+                             choices=['adam', 'lbfgs', 'lbfgs_torch', 'sgd'],
                              help='Optimizer to use (default: adam)')
     train_parser.add_argument('--lbfgs_maxiter', type=int, default=20,
-                             help='Maximum iterations per step for L-BFGS-B optimizer (default: 20)')
+                             help='Maximum iterations per step for L-BFGS optimizer (default: 20)')
+    train_parser.add_argument('--lbfgs_history_size', type=int, default=10,
+                             help='History size for L-BFGS (default: 10)')
+    train_parser.add_argument('--lbfgs_ftol', type=float, default=1e-8,
+                             help='Function tolerance for L-BFGS-B (default: 1e-8)')
+    train_parser.add_argument('--lbfgs_gtol', type=float, default=1e-6,
+                             help='Gradient tolerance for L-BFGS-B (default: 1e-6)')
+    train_parser.add_argument('--lbfgs_maxls', type=int, default=20,
+                             help='Maximum line search steps for L-BFGS-B (default: 20)')
+    train_parser.add_argument('--lbfgs_maxfun', type=int, default=0,
+                             help='Maximum function evaluations for L-BFGS-B (0=auto maxiter*10)')
     train_parser.add_argument('--risk_weight', type=float, default=0.005,
                              help='Risk regularization weight')
     train_parser.add_argument('--seed', type=int, default=42,
@@ -180,6 +190,11 @@ Examples:
             '--lr', str(args.lr),
             '--optimizer', str(getattr(args, 'optimizer', 'adam')),
             '--lbfgs_maxiter', str(getattr(args, 'lbfgs_maxiter', 20)),
+            '--lbfgs_history_size', str(getattr(args, 'lbfgs_history_size', 10)),
+            '--lbfgs_ftol', str(getattr(args, 'lbfgs_ftol', 1e-8)),
+            '--lbfgs_gtol', str(getattr(args, 'lbfgs_gtol', 1e-6)),
+            '--lbfgs_maxls', str(getattr(args, 'lbfgs_maxls', 20)),
+            '--lbfgs_maxfun', str(getattr(args, 'lbfgs_maxfun', 0)),
             '--risk_weight', str(args.risk_weight),
             '--seed', str(args.seed),
             '--device', args.device,
