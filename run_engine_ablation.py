@@ -26,7 +26,7 @@ import uncertainty_toolbox as uct
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Default seeds for experiments
-DEFAULT_SEEDS = [42, 43, 44, 45, 46]
+DEFAULT_SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 
 # Engine combinations
 ENGINE_COMBINATIONS = {
@@ -35,10 +35,10 @@ ENGINE_COMBINATIONS = {
         'engines': ['DynamicBind', 'flowdock'],
         'expert_flags': {'expert3_only': True, 'expert4_only': True}
     },
-    'MoNIG_3engines_dynamicbind_surfdock_gnina': {
-        'name': 'MoNIG_3engines_dynamicbind_surfdock_gnina',
-        'engines': ['DynamicBind', 'flowdock', 'GNINA'],
-        'expert_flags': {'expert1_only': True, 'expert3_only': True, 'expert4_only': True}
+    'MoNIG_3engines_dynamicbind_surfdock_bind': {
+        'name': 'MoNIG_3engines_dynamicbind_surfdock_bind',
+        'engines': ['DynamicBind', 'flowdock', 'BIND'],
+        'expert_flags': {'expert2_only': True, 'expert3_only': True, 'expert4_only': True}
     }
 }
 
@@ -523,7 +523,7 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.01,
+    parser.add_argument('--risk_weight', type=float, default=0.001,
                        help='Risk regularization weight (for MoNIG)')
     
     # Output
