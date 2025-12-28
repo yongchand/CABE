@@ -30,17 +30,12 @@ class DrugDiscoveryMoNIGEmb(nn.Module):
         ])
         
         # Reliability Net: Embeddings → reliability scores r_j ∈ (0,1) per engine
+        # Very simple architecture to reduce overfitting and encourage learning
         self.reliability_net = nn.Sequential(
-            nn.Linear(self.embedding_dim, 512),
+            nn.Linear(self.embedding_dim, 128),  # Further reduced
             nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(self.dropout),
-            nn.Linear(128, self.num_experts),  # Output one reliability score per expert
+            nn.Dropout(self.dropout * 2.0),  # Higher dropout (0.4)
+            nn.Linear(128, self.num_experts),  # Direct to output
             nn.Sigmoid()  # Ensure r_j ∈ (0,1)
         )
     

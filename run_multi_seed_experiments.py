@@ -37,7 +37,6 @@ ALL_MODEL_TYPES = [
     'Baseline',
     'DeepEnsemble',
     'MCDropout',
-    'SoftmaxMoE',
     'DeepEnsembleMVE',
     'CFGP',
     'SWAG'
@@ -518,7 +517,7 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.005,
+    parser.add_argument('--risk_weight', type=float, default=0.001,
                        help='Risk regularization weight (for NIG/MoNIG)')
     
     # Output
