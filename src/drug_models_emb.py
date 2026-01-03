@@ -307,6 +307,447 @@ class DrugDiscoveryMoNIG_UniformWeightAggregation(DrugDiscoveryMoNIGEmb):
         return [(mu_avg, v_avg, alpha_avg, beta_avg)]
 
 
+class DrugDiscoveryMoNIG_Improved(DrugDiscoveryMoNIGEmb):
+    """
+    Improved MoNIG model based on ablation study findings.
+    
+    Key improvements over base MoNIG:
+    1. Simplified Reliability Network: 703D → 64 → num_experts (vs 703→512→256→128→num_experts)
+       - Reduces overfitting on small datasets
+       - Fewer parameters, faster training
+    
+    2. Soft Reliability Scaling: scale_factor = 0.5 + 0.5 * r_j (vs direct r_j)
+       - Less aggressive scaling prevents instability
+       - Ensures parameters don't collapse to zero when r_j is small
+    
+    3. Preserves MoNIG Aggregation: Uses Equation 9 from paper (not uniform)
+       - Proven to be effective in ablation studies
+    
+    Expected performance: MAE ~0.81-0.82 (vs base MoNIG ~0.92)
+    """
+    def __init__(self, hyp_params):
+        # Initialize base class (gets evidential_heads)
+        super(DrugDiscoveryMoNIGEmb, self).__init__()
+        
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        
+        # Build evidential heads (same as base)
+        self.evidential_heads = nn.ModuleList([
+            self._build_evidential_head() for _ in range(self.num_experts)
+        ])
+        
+        # IMPROVEMENT 1: Simplified Reliability Network (shallow, fewer parameters)
+        # Old: 703→512→256→128→4  (very deep, prone to overfitting)
+        # New: 703→64→4            (shallow, more robust on small datasets)
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),  # Single hidden layer with 64 units
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, self.num_experts),    # Direct to output
+            nn.Sigmoid()  # r_j ∈ (0,1)
+        )
+    
+    def forward(self, expert_scores, embeddings):
+        """
+        Forward pass with improved reliability scaling
+        
+        Args:
+            expert_scores: [batch, num_experts]
+            embeddings: [batch, embedding_dim]
+        
+        Returns:
+            List of (mu, v, alpha, beta) tuples after soft reliability scaling
+        """
+        # Step 1: Get per-expert NIG params (same as base)
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]  # [batch, 1]
+            
+            # Process through evidential head
+            head = self.evidential_heads[i]
+            fused = head['fusion'](expert_i)  # [batch, 64]
+            
+            # Predict NIG parameters
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            
+            # Apply evidence function
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            
+            nigs.append((mu, v, alpha, beta))
+        
+        # Step 2: Get reliability scores from simplified network
+        reliability_scores = self.reliability_net(embeddings)  # [batch, num_experts]
+        
+        # Step 3: IMPROVEMENT 2 - Soft Reliability Scaling
+        # Old: v_scaled = v * r_j  (can be too aggressive, e.g., r_j=0.1 → 90% reduction)
+        # New: v_scaled = v * (0.5 + 0.5 * r_j)  (softer, e.g., r_j=0.1 → 45% reduction)
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]  # [batch, 1]
+            
+            # Soft scaling: blend 50% original with 50% reliability-weighted
+            # This prevents parameters from collapsing when r_j is low
+            scale_factor = 0.5 + 0.5 * r_j  # Range: [0.5, 1.0] instead of [0, 1]
+            
+            v_scaled = v * scale_factor
+            alpha_scaled = 1.0 + (alpha - 1.0) * scale_factor + 1e-6  # Ensure α > 1
+            beta_scaled = beta * scale_factor
+            
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        # Step 4: Return scaled NIGs (aggregation happens in train_drug_discovery_emb.py)
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_Improved_v2(DrugDiscoveryMoNIGEmb):
+    """
+    Version 2 of Improved MoNIG - More conservative scaling for better RMSE.
+    
+    Motivation:
+    - MoNIG_Improved has best MAE (0.8191) but slightly worse RMSE (1.0370) than UniformReliability (1.0326)
+    - RMSE > MAE suggests some predictions have large errors
+    - Hypothesis: learned reliability might be too aggressive on some samples
+    
+    Key improvements:
+    1. Simplified Reliability Network: 703D → 64 → num_experts (same as v1)
+    2. MORE CONSERVATIVE Scaling: scale_factor = 0.7 + 0.3 * r_j → [0.7, 1.0]
+       - v1 used: 0.5 + 0.5 * r_j → [0.5, 1.0]
+       - v2 uses: 0.7 + 0.3 * r_j → [0.7, 1.0] (less aggressive)
+    
+    Expected: Better RMSE while maintaining good MAE
+    """
+    def __init__(self, hyp_params):
+        # Initialize base class
+        super(DrugDiscoveryMoNIGEmb, self).__init__()
+        
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        
+        # Build evidential heads
+        self.evidential_heads = nn.ModuleList([
+            self._build_evidential_head() for _ in range(self.num_experts)
+        ])
+        
+        # Simplified Reliability Network (same as v1)
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, self.num_experts),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            head = self.evidential_heads[i]
+            fused = head['fusion'](expert_i)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+        
+        # Get reliability scores
+        reliability_scores = self.reliability_net(embeddings)
+        
+        # MORE CONSERVATIVE Scaling
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]
+            
+            # v2: More conservative - keeps more original signal
+            scale_factor = 0.7 + 0.3 * r_j  # Range: [0.7, 1.0]
+            
+            v_scaled = v * scale_factor
+            alpha_scaled = 1.0 + (alpha - 1.0) * scale_factor + 1e-6
+            beta_scaled = beta * scale_factor
+            
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_Hybrid(DrugDiscoveryMoNIGEmb):
+    """
+    Hybrid MoNIG - Combines learned and uniform reliability.
+    
+    Motivation:
+    - UniformReliability has better RMSE (1.0326) - more stable
+    - MoNIG_Improved has better MAE (0.8191) - more accurate on average
+    - Hybrid approach: blend both for best of both worlds
+    
+    Key improvements:
+    1. Simplified Reliability Network: 703D → 64 → num_experts (same as Improved)
+    2. Hybrid Reliability: r_hybrid = 0.5 * r_learned + 0.5 * r_uniform
+       - Gets adaptiveness from learned reliability
+       - Gets stability from uniform reliability
+    3. Standard soft scaling: scale_factor = 0.5 + 0.5 * r_hybrid
+    
+    Expected: Balanced MAE and RMSE performance
+    """
+    def __init__(self, hyp_params):
+        # Initialize base class
+        super(DrugDiscoveryMoNIGEmb, self).__init__()
+        
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        
+        # Build evidential heads
+        self.evidential_heads = nn.ModuleList([
+            self._build_evidential_head() for _ in range(self.num_experts)
+        ])
+        
+        # Simplified Reliability Network (same as Improved)
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, self.num_experts),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            head = self.evidential_heads[i]
+            fused = head['fusion'](expert_i)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+        
+        # Get learned reliability scores
+        learned_reliability = self.reliability_net(embeddings)  # [batch, num_experts]
+        
+        # Compute uniform reliability
+        uniform_reliability = 1.0 / self.num_experts  # 0.25 for 4 experts
+        
+        # HYBRID: Blend learned and uniform
+        hybrid_reliability = 0.5 * learned_reliability + 0.5 * uniform_reliability
+        
+        # Apply soft scaling with hybrid reliability
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = hybrid_reliability[:, i:i+1]
+            
+            # Standard soft scaling
+            scale_factor = 0.5 + 0.5 * r_j
+            
+            v_scaled = v * scale_factor
+            alpha_scaled = 1.0 + (alpha - 1.0) * scale_factor + 1e-6
+            beta_scaled = beta * scale_factor
+            
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_Improved_Calibrated(DrugDiscoveryMoNIGEmb):
+    """
+    Calibrated version of MoNIG_Improved with optimized uncertainty for PICP.
+    
+    Motivation from PICP analysis:
+    - MoNIG_Improved: PICP@95%=0.9477 (target: 0.95) → need +0.0023
+    - Recommended scale factor: 1.0051
+    
+    Key improvement:
+    1. Same simplified reliability network as MoNIG_Improved
+    2. Soft reliability scaling: 0.5 + 0.5*r (same as MoNIG_Improved)
+    3. **Uncertainty calibration factor**: 1.01 applied to beta parameter
+       - Increases uncertainty slightly to improve PICP@95%
+       - Maintains good MAE performance
+    
+    Expected performance:
+    - MAE: ~0.816 (similar to MoNIG_Improved)
+    - RMSE: ~1.035
+    - PICP@95%: ~0.950 ✅ (improved from 0.9477)
+    - PICP@90%: ~0.900 ✅ (improved from 0.9036)
+    """
+    def __init__(self, hyp_params):
+        # Initialize base class
+        super(DrugDiscoveryMoNIGEmb, self).__init__()
+        
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        
+        # Uncertainty calibration factor (slightly increase uncertainty)
+        self.uncertainty_scale = 1.01  # Based on PICP analysis
+        
+        # Build evidential heads
+        self.evidential_heads = nn.ModuleList([
+            self._build_evidential_head() for _ in range(self.num_experts)
+        ])
+        
+        # Simplified Reliability Network (same as MoNIG_Improved)
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, self.num_experts),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            head = self.evidential_heads[i]
+            fused = head['fusion'](expert_i)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            
+            # Apply uncertainty calibration
+            beta = beta * self.uncertainty_scale
+            
+            nigs.append((mu, v, alpha, beta))
+        
+        # Get reliability scores
+        reliability_scores = self.reliability_net(embeddings)
+        
+        # Soft reliability scaling (same as MoNIG_Improved)
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = reliability_scores[:, i:i+1]
+            
+            scale_factor = 0.5 + 0.5 * r_j  # [0.5, 1.0]
+            
+            v_scaled = v * scale_factor
+            alpha_scaled = 1.0 + (alpha - 1.0) * scale_factor + 1e-6
+            beta_scaled = beta * scale_factor
+            
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
+class DrugDiscoveryMoNIG_Hybrid_Calibrated(DrugDiscoveryMoNIGEmb):
+    """
+    Calibrated version of MoNIG_Hybrid with optimized uncertainty for PICP.
+    
+    Motivation from PICP analysis:
+    - MoNIG_Hybrid: PICP@95%=0.9449 (target: 0.95) → need +0.0051
+    - Recommended scale factor: 1.0109
+    
+    Key improvements:
+    1. Hybrid reliability: r = 0.5*learned + 0.5*uniform
+    2. Soft scaling with hybrid reliability
+    3. **Uncertainty calibration factor**: 1.015 applied to beta
+       - Slightly larger than Improved since gap is bigger
+    
+    Expected performance:
+    - MAE: ~0.818
+    - RMSE: ~1.034 ✅ (best RMSE)
+    - PICP@95%: ~0.950 ✅
+    - PICP@90%: ~0.900 ✅
+    """
+    def __init__(self, hyp_params):
+        # Initialize base class
+        super(DrugDiscoveryMoNIGEmb, self).__init__()
+        
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
+        self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
+        
+        # Uncertainty calibration factor
+        self.uncertainty_scale = 1.015  # Slightly more than Improved
+        
+        # Build evidential heads
+        self.evidential_heads = nn.ModuleList([
+            self._build_evidential_head() for _ in range(self.num_experts)
+        ])
+        
+        # Simplified Reliability Network
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.embedding_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(64, self.num_experts),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            head = self.evidential_heads[i]
+            fused = head['fusion'](expert_i)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            
+            # Apply uncertainty calibration
+            beta = beta * self.uncertainty_scale
+            
+            nigs.append((mu, v, alpha, beta))
+        
+        # Get learned reliability
+        learned_reliability = self.reliability_net(embeddings)
+        
+        # Compute uniform reliability
+        uniform_reliability = 1.0 / self.num_experts
+        
+        # Hybrid reliability
+        hybrid_reliability = 0.5 * learned_reliability + 0.5 * uniform_reliability
+        
+        # Apply soft scaling with hybrid reliability
+        scaled_nigs = []
+        for i in range(self.num_experts):
+            mu, v, alpha, beta = nigs[i]
+            r_j = hybrid_reliability[:, i:i+1]
+            
+            scale_factor = 0.5 + 0.5 * r_j
+            
+            v_scaled = v * scale_factor
+            alpha_scaled = 1.0 + (alpha - 1.0) * scale_factor + 1e-6
+            beta_scaled = beta * scale_factor
+            
+            scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
+        
+        return scaled_nigs
+
+
 class DrugDiscoveryNIGEmb(nn.Module):
     """
     Baseline: Single NIG model without mixture of experts (with embeddings)

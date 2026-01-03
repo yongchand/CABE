@@ -17,6 +17,8 @@ from src.drug_models_emb import (
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
     DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
     DrugDiscoveryMoNIG_NoContextReliability, DrugDiscoveryMoNIG_UniformWeightAggregation,
+    DrugDiscoveryMoNIG_Improved, DrugDiscoveryMoNIG_Improved_v2, DrugDiscoveryMoNIG_Hybrid,
+    DrugDiscoveryMoNIG_Improved_Calibrated, DrugDiscoveryMoNIG_Hybrid_Calibrated,
     DrugDiscoverySoftmaxMoE,
     DrugDiscoveryDeepEnsembleMVE,
     DrugDiscoveryCFGP, DrugDiscoverySWAG
@@ -291,6 +293,10 @@ def main():
     # Model config (must match training)
     parser.add_argument('--model_type', type=str, default=None,
                        choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
+                                'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability',
+                                'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
+                                'MoNIG_Improved', 'MoNIG_Improved_v2', 'MoNIG_Hybrid',
+                                'MoNIG_Improved_Calibrated', 'MoNIG_Hybrid_Calibrated',
                                 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
                        help='Model type (auto-detected from model_path if not provided)')
     parser.add_argument('--hidden_dim', type=int, default=256,
@@ -459,6 +465,16 @@ def main():
         model = DrugDiscoveryMoNIG_NoContextReliability(hyp_params)
     elif args.model_type == 'MoNIG_UniformWeightAggregation':
         model = DrugDiscoveryMoNIG_UniformWeightAggregation(hyp_params)
+    elif args.model_type == 'MoNIG_Improved':
+        model = DrugDiscoveryMoNIG_Improved(hyp_params)
+    elif args.model_type == 'MoNIG_Improved_v2':
+        model = DrugDiscoveryMoNIG_Improved_v2(hyp_params)
+    elif args.model_type == 'MoNIG_Hybrid':
+        model = DrugDiscoveryMoNIG_Hybrid(hyp_params)
+    elif args.model_type == 'MoNIG_Improved_Calibrated':
+        model = DrugDiscoveryMoNIG_Improved_Calibrated(hyp_params)
+    elif args.model_type == 'MoNIG_Hybrid_Calibrated':
+        model = DrugDiscoveryMoNIG_Hybrid_Calibrated(hyp_params)
     elif args.model_type == 'NIG':
         model = DrugDiscoveryNIGEmb(hyp_params)
     elif args.model_type == 'Gaussian':

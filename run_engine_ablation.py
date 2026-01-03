@@ -30,16 +30,16 @@ DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 
 # Engine combinations
 ENGINE_COMBINATIONS = {
-    # 'MoNIG_2engines_dynamicbind_surfdock': {
-    #     'name': 'MoNIG_2engines_dynamicbind_surfdock',
-    #     'engines': ['DynamicBind', 'flowdock'],
-    #     'expert_flags': {'expert3_only': True, 'expert4_only': True}
-    # },
-    'MoNIG_3engines_dynamicbind_surfdock_gnina': {
-        'name': 'MoNIG_3engines_dynamicbind_surfdock_gnina',
-        'engines': ['DynamicBind', 'flowdock', 'GNINA'],
-        'expert_flags': {'expert2_only': True, 'expert3_only': True, 'expert4_only': True}
-    }
+    'MoNIG_2engines_dynamicbind_surfdock': {
+        'name': 'MoNIG_2engines_dynamicbind_surfdock',
+        'engines': ['DynamicBind', 'flowdock'],
+        'expert_flags': {'expert3_only': True, 'expert4_only': True}
+    },
+    # 'MoNIG_3engines_dynamicbind_surfdock_gnina': {
+    #     'name': 'MoNIG_3engines_dynamicbind_surfdock_gnina',
+    #     'engines': ['DynamicBind', 'flowdock', 'GNINA'],
+    #     'expert_flags': {'expert2_only': True, 'expert3_only': True, 'expert4_only': True}
+    # }
 }
 
 

@@ -46,10 +46,12 @@ Examples:
     # Model
     train_parser.add_argument('--model_type', type=str, default='MoNIG',
                              choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
-                                      'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
-                                      'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
-                                      'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
-                             help='Model type (including ablation variants and UQ baselines)')
+                                     'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
+                                     'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
+                                     'MoNIG_Improved', 'MoNIG_Improved_v2', 'MoNIG_Hybrid',
+                                     'MoNIG_Improved_Calibrated', 'MoNIG_Hybrid_Calibrated',
+                                     'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                            help='Model type (including ablation variants and UQ baselines)')
     train_parser.add_argument('--hidden_dim', type=int, default=256,
                              help='Hidden dimension')
     train_parser.add_argument('--dropout', type=float, default=0.2,
@@ -142,6 +144,16 @@ Examples:
     infer_parser.add_argument('--expert4_only', action='store_true',
                              help='Use only Expert 4 (DynamicBind) - must match training')
     
+    # Model type (must match training)
+    infer_parser.add_argument('--model_type', type=str, default=None,
+                             choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
+                                     'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
+                                     'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
+                                     'MoNIG_Improved', 'MoNIG_Improved_v2', 'MoNIG_Hybrid',
+                                     'MoNIG_Improved_Calibrated', 'MoNIG_Hybrid_Calibrated',
+                                     'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                            help='Model type (auto-detected from model_path if not provided)')
+    
     # Model config (must match training)
     infer_parser.add_argument('--hidden_dim', type=int, default=256,
                              help='Hidden dimension (must match training)')
@@ -233,6 +245,8 @@ Examples:
             '--seed', str(getattr(args, 'seed', 42)),
             '--device', args.device,
         ]
+        if args.model_type:
+            infer_args.extend(['--model_type', args.model_type])
         if args.norm_stats_path:
             infer_args.extend(['--norm_stats_path', args.norm_stats_path])
         if args.expert1_only:

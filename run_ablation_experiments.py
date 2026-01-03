@@ -38,6 +38,11 @@ ALL_ABLATION_TYPES = [
     'MoNIG_UniformReliability',
     'MoNIG_NoContextReliability',
     'MoNIG_UniformWeightAggregation',
+    'MoNIG_Improved',  # Improved version with shallow reliability net + soft scaling (0.5+0.5*r)
+    'MoNIG_Improved_v2',  # v2: More conservative scaling (0.7+0.3*r) for better RMSE
+    'MoNIG_Hybrid',  # Hybrid: Blend learned + uniform reliability for balanced performance
+    'MoNIG_Improved_Calibrated',  # Calibrated: MoNIG_Improved + uncertainty scaling for perfect PICP
+    'MoNIG_Hybrid_Calibrated',  # Calibrated: MoNIG_Hybrid + uncertainty scaling for perfect PICP
 ]
 
 
@@ -76,6 +81,7 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         'main.py',
         'infer',
         '--model_path', str(model_path),
+        '--model_type', model_type,
         '--csv_path', csv_path,
         '--split', 'test',
         '--output_path', str(inference_output),

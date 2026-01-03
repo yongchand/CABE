@@ -100,8 +100,10 @@ desktop.ini
 # Environment variables
 .env
 .env.local
+.conda/
 
 # Analysis outputs
 stats_output/
 analysis_results/
+
 
