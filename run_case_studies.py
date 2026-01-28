@@ -301,30 +301,62 @@ def analyze_epistemic_vs_disagreement(df, output_dir=None):
         'std_disagreement': disagreement.std(),
     }
     
-    # Create scatter plot
+    # Create scatter plot - Publication quality
     if output_dir:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        plt.figure(figsize=(10, 6))
-        plt.scatter(disagreement, epistemic, alpha=0.5, s=20)
+        # Publication-quality settings
+        plt.rcParams.update({
+            'font.size': 12,
+            'axes.labelsize': 14,
+            'axes.titlesize': 14,
+            'xtick.labelsize': 12,
+            'ytick.labelsize': 12,
+        })
+        
+        fig, ax = plt.subplots(figsize=(6, 5))
+        
+        # Scatter plot with subtle styling
+        ax.scatter(disagreement, epistemic, 
+                   c='#2E86AB', alpha=0.6, s=35, edgecolors='white', linewidth=0.3)
         
         # Add trend line
         z = np.polyfit(disagreement, epistemic, 1)
         p = np.poly1d(z)
         x_trend = np.linspace(disagreement.min(), disagreement.max(), 100)
-        plt.plot(x_trend, p(x_trend), "r--", alpha=0.8, linewidth=2, label=f'Trend line')
+        y_trend = p(x_trend)
+        ax.plot(x_trend, y_trend, color='#E94F37', linestyle='--', linewidth=2.5,
+                label=f'r = {pearson_corr:.3f}')
         
-        plt.xlabel('Expert Disagreement (Std of Predictions)', fontsize=12)
-        plt.ylabel('MoNIG Epistemic Uncertainty', fontsize=12)
-        plt.title(f'Epistemic Uncertainty vs Expert Disagreement\n(Pearson r={pearson_corr:.3f}, p={pearson_p:.2e})', fontsize=14)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        ax.set_xlabel('Expert Disagreement (pKd)', fontsize=14)
+        ax.set_ylabel('CABE Epistemic Uncertainty', fontsize=14)
+        
+        # Clean legend
+        ax.legend(loc='upper left', fontsize=12, frameon=True, fancybox=False, 
+                  edgecolor='gray', framealpha=0.9)
+        
+        # Subtle grid
+        ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
+        # Clean spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.2)
+        ax.spines['bottom'].set_linewidth(1.2)
+        
         plt.tight_layout()
         
+        # Save as PNG and PDF
         plot_path = output_path / 'epistemic_vs_disagreement.png'
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        plot_path_pdf = output_path / 'epistemic_vs_disagreement.pdf'
+        plt.savefig(plot_path_pdf, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
         plt.close()
+        
+        # Reset rcParams
+        plt.rcParams.update(plt.rcParamsDefault)
         
         print(f"📊 Saved epistemic vs disagreement plot to: {plot_path}")
     
@@ -378,45 +410,62 @@ def analyze_disagreement_vs_error(df, output_dir=None):
         'std_error': monig_error.std(),
     }
     
-    # Create scatter plot
+    # Create scatter plot - Publication quality
     if output_dir:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        fig, ax = plt.subplots(figsize=(10, 6))
+        # Publication-quality settings
+        plt.rcParams.update({
+            'font.size': 12,
+            'axes.labelsize': 14,
+            'axes.titlesize': 14,
+            'xtick.labelsize': 12,
+            'ytick.labelsize': 12,
+        })
         
-        # Scatter plot with color gradient based on error
-        scatter = ax.scatter(disagreement, monig_error, 
-                           c=monig_error, cmap='RdYlGn_r', 
-                           alpha=0.6, s=40, edgecolors='black', linewidth=0.5)
+        fig, ax = plt.subplots(figsize=(6, 5))
         
-        # Add colorbar
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('MoNIG Error (pKd)', fontsize=10)
+        # Simple scatter plot without colorbar
+        ax.scatter(disagreement, monig_error, 
+                   c='#2E86AB', alpha=0.6, s=35, edgecolors='white', linewidth=0.3)
         
         # Add trend line
         z = np.polyfit(disagreement, monig_error, 1)
         p = np.poly1d(z)
         x_trend = np.linspace(disagreement.min(), disagreement.max(), 100)
-        ax.plot(x_trend, p(x_trend), "b--", alpha=0.8, linewidth=2, 
-               label=f'Trend line (slope={z[0]:.3f})')
+        y_trend = p(x_trend)
+        ax.plot(x_trend, y_trend, color='#E94F37', linestyle='--', linewidth=2.5,
+                label=f'r = {pearson_corr:.3f}')
         
-        # Add horizontal lines for error thresholds
-        ax.axhline(y=0.5, color='green', linestyle=':', alpha=0.5, label='Good (< 0.5)')
-        ax.axhline(y=1.5, color='orange', linestyle=':', alpha=0.5, label='Acceptable (< 1.5)')
-        ax.axhline(y=3.0, color='red', linestyle=':', alpha=0.5, label='Catastrophic (> 3.0)')
+        ax.set_xlabel('Expert Disagreement (pKd)', fontsize=14)
+        ax.set_ylabel('CABE Prediction Error (pKd)', fontsize=14)
         
-        ax.set_xlabel('Expert Disagreement (Std of Predictions, pKd)', fontsize=12)
-        ax.set_ylabel('MoNIG Prediction Error (pKd)', fontsize=12)
-        ax.set_title(f'Expert Disagreement vs MoNIG Error\n(Pearson r={pearson_corr:.3f}, p={pearson_p:.2e})', 
-                    fontsize=14, fontweight='bold')
-        ax.legend(loc='upper left', fontsize=9)
-        ax.grid(True, alpha=0.3)
+        # Clean legend
+        ax.legend(loc='upper left', fontsize=12, frameon=True, fancybox=False,
+                  edgecolor='gray', framealpha=0.9)
+        
+        # Subtle grid
+        ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+        ax.set_axisbelow(True)
+        
+        # Clean spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.2)
+        ax.spines['bottom'].set_linewidth(1.2)
+        
         plt.tight_layout()
         
+        # Save as PNG and PDF
         plot_path = output_path / 'disagreement_vs_error.png'
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
+        plot_path_pdf = output_path / 'disagreement_vs_error.pdf'
+        plt.savefig(plot_path_pdf, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
         plt.close()
+        
+        # Reset rcParams
+        plt.rcParams.update(plt.rcParamsDefault)
         
         print(f"📊 Saved disagreement vs error plot to: {plot_path}")
     
@@ -867,128 +916,185 @@ def plot_disagreement_histogram(df, output_dir=None):
     return stats_dict
 
 
-def analyze_error_correlation_matrix(df, num_experts=4, output_dir=None):
+def analyze_error_correlation_matrix(df, num_experts=4, output_dir=None, original_csv_path='pdbbind_descriptors_with_experts_and_binding.csv'):
     """
     Create error correlation matrix showing how errors correlate between engines.
+    Only includes the 4 engines (GNINA, BIND, flowdock, DynamicBind), excludes CABE/MoNIG.
+    Uses ALL data from the original CSV, not just train/test/val splits.
     
     Args:
-        df: DataFrame with error columns
+        df: DataFrame with error columns (used for reference, but we load all data)
         num_experts: Number of experts
         output_dir: Directory to save plot
+        original_csv_path: Path to original dataset CSV with all data
     
     Returns:
         dict: Correlation matrix and statistics
     """
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from scipy import stats
+    import re
     
-    # Get error columns
-    engine_names = EXPERT_NAMES + ['MoNIG']
-    error_cols = [f'{name}_Error' for name in engine_names]
-    
-    # Check which columns exist
-    available_cols = [col for col in error_cols if col in df.columns]
-    available_names = [name for name, col in zip(engine_names, error_cols) if col in df.columns]
-    
-    if len(available_cols) < 2:
-        print("⚠️  Not enough error columns available for correlation analysis")
+    # Load ALL data from original CSV (not just inference results)
+    print("  Loading all data from original CSV for error correlation...")
+    try:
+        all_data = pd.read_csv(original_csv_path)
+        print(f"  Loaded {len(all_data)} rows from {original_csv_path}")
+    except Exception as e:
+        print(f"  ⚠️  Error loading CSV: {e}")
         return None
     
-    # Extract error values
-    error_data = df[available_cols].values
+    # Calculate errors for all complexes using original expert predictions
+    engine_names = EXPERT_NAMES  # Only the 4 engines: GNINA, BIND, flowdock, DynamicBind
+    expert_prediction_cols = ['GNINA_Affinity', 'BIND_pIC50', 'flowdock_score', 'DynamicBind_score']
     
-    # Calculate correlation matrix (Pearson)
-    corr_matrix_pearson = np.corrcoef(error_data.T)
+    # Parse Binding_Affinity from strings like 'Ki=38fM', 'Kd=20uM' to numeric pKd/pKi
+    if 'Binding_Affinity' not in all_data.columns:
+        print(f"  ⚠️  Binding_Affinity column not found in CSV")
+        return None
     
-    # Calculate Spearman correlation
-    corr_matrix_spearman = np.zeros_like(corr_matrix_pearson)
-    for i in range(len(available_cols)):
-        for j in range(len(available_cols)):
+    # Use the same parsing function as the dataset
+    binding_affinity = []
+    for s in all_data['Binding_Affinity'].values:
+        try:
+            # Extract numeric value and unit
+            match = re.search(r'([0-9.]+)([a-zA-Z]+)', str(s))
+            if match:
+                value = float(match.group(1))
+                unit = match.group(2).lower()
+                
+                # Convert to Molar (check longer units first to avoid partial matches)
+                if 'fm' in unit:
+                    molar = value * 1e-15
+                elif 'pm' in unit:
+                    molar = value * 1e-12
+                elif 'nm' in unit:
+                    molar = value * 1e-9
+                elif 'um' in unit or 'μm' in unit:
+                    molar = value * 1e-6
+                elif 'mm' in unit:
+                    molar = value * 1e-3
+                elif unit == 'm':
+                    molar = value
+                else:
+                    binding_affinity.append(np.nan)
+                    continue
+                
+                # Convert to pKd/pKi
+                p_value = -np.log10(molar)
+                binding_affinity.append(p_value)
+            else:
+                binding_affinity.append(np.nan)
+        except Exception:
+            binding_affinity.append(np.nan)
+    
+    binding_affinity = np.array(binding_affinity)
+    binding_valid = (~np.isnan(binding_affinity)).sum()
+    print(f"  Binding_Affinity: {binding_valid} valid parsed values out of {len(binding_affinity)}")
+    
+    # Calculate errors for each engine
+    error_data_list = []
+    available_names = []
+    for j in range(num_experts):
+        if expert_prediction_cols[j] in all_data.columns:
+            # Convert to numeric, coercing errors to NaN
+            expert_pred = pd.to_numeric(all_data[expert_prediction_cols[j]], errors='coerce')
+            expert_valid = expert_pred.notna().sum()
+            
+            # Calculate absolute error (will be NaN if either is NaN)
+            errors = np.abs(expert_pred - binding_affinity)
+            error_valid = (~pd.isna(errors)).sum()
+            
+            print(f"  {engine_names[j]}: {expert_valid} valid predictions, {error_valid} valid errors")
+            
+            error_data_list.append(errors.values)
+            available_names.append(engine_names[j])
+        else:
+            print(f"  ⚠️  Column {expert_prediction_cols[j]} not found in CSV")
+    
+    if len(error_data_list) < 2:
+        print(f"  ⚠️  Not enough expert columns available for correlation analysis (found {len(error_data_list)} columns)")
+        return None
+    
+    # Stack error data: shape (num_samples, num_engines)
+    error_data = np.column_stack(error_data_list)
+    
+    # Remove rows where any engine has NaN (need complete data for correlation)
+    valid_rows = ~np.isnan(error_data).any(axis=1)
+    print(f"  Rows with all {len(available_names)} engines having valid errors: {valid_rows.sum()} out of {len(valid_rows)}")
+    error_data = error_data[valid_rows]
+    print(f"  Valid data points after removing NaN: {error_data.shape[0]} (from {len(valid_rows)} total)")
+    
+    if error_data.shape[0] < 2:
+        print(f"  ⚠️  Not enough valid data points for correlation analysis (only {error_data.shape[0]} valid points)")
+        print(f"  This means no rows have all {len(available_names)} engines with valid data simultaneously.")
+        print(f"  Consider checking if Binding_Affinity or expert predictions have many missing values.")
+        return None
+    
+    # Calculate correlation matrix (Spearman - more appropriate for error data)
+    # Spearman is rank-based and more robust to outliers and non-normal distributions
+    from scipy import stats
+    num_engines = error_data.shape[1]
+    corr_matrix_spearman = np.zeros((num_engines, num_engines))
+    for i in range(num_engines):
+        for j in range(num_engines):
             if i == j:
                 corr_matrix_spearman[i, j] = 1.0
             else:
                 corr, _ = stats.spearmanr(error_data[:, i], error_data[:, j])
                 corr_matrix_spearman[i, j] = corr
     
+    # Use Spearman for the plot
+    corr_matrix = corr_matrix_spearman
+    
     # Create visualizations
     if output_dir:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
+        print(f"  Saving plot to: {output_path.absolute()}")
         
-        # Create figure with two subplots (Pearson and Spearman)
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+        # Create figure with single subplot (Pearson only)
+        fig, ax = plt.subplots(1, 1, figsize=(8, 7))
         
-        # Plot 1: Pearson correlation
-        mask = np.triu(np.ones_like(corr_matrix_pearson, dtype=bool), k=1)
-        sns.heatmap(corr_matrix_pearson, 
+        # Plot Spearman correlation (more appropriate for error data) - NO colorbar, BIGGER numbers
+        mask = np.triu(np.ones_like(corr_matrix, dtype=bool), k=1)
+        sns.heatmap(corr_matrix, 
                    mask=mask,
                    annot=True, 
-                   fmt='.3f',
+                   fmt='.2f',
+                   annot_kws={'size': 16, 'weight': 'bold'},
                    cmap='RdYlBu_r',
                    center=0,
                    vmin=-0.5,
                    vmax=1.0,
                    square=True,
                    linewidths=1,
-                   cbar_kws={"shrink": 0.8, "label": "Correlation"},
+                   cbar=False,  # Remove colorbar
                    xticklabels=available_names,
                    yticklabels=available_names,
-                   ax=ax1)
+                   ax=ax)
         
-        ax1.set_title('Error Correlation Matrix (Pearson)\nLower Triangle Only', 
-                     fontsize=14, fontweight='bold', pad=20)
-        ax1.set_xlabel('Engine', fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Engine', fontsize=12, fontweight='bold')
+        ax.set_xlabel('Engine', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Engine', fontsize=12, fontweight='bold')
         
-        # Plot 2: Spearman correlation
-        sns.heatmap(corr_matrix_spearman,
-                   mask=mask,
-                   annot=True,
-                   fmt='.3f',
-                   cmap='RdYlBu_r',
-                   center=0,
-                   vmin=-0.5,
-                   vmax=1.0,
-                   square=True,
-                   linewidths=1,
-                   cbar_kws={"shrink": 0.8, "label": "Correlation"},
-                   xticklabels=available_names,
-                   yticklabels=available_names,
-                   ax=ax2)
+        plt.tight_layout()
         
-        ax2.set_title('Error Correlation Matrix (Spearman)\nLower Triangle Only', 
-                     fontsize=14, fontweight='bold', pad=20)
-        ax2.set_xlabel('Engine', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Engine', fontsize=12, fontweight='bold')
-        
-        # Add interpretation text
-        textstr = 'Interpretation:\n'
-        textstr += '• High correlation (>0.7): Errors are similar\n'
-        textstr += '• Moderate (0.4-0.7): Some overlap in errors\n'
-        textstr += '• Low (<0.4): Complementary/diverse errors\n'
-        textstr += '• Negative: Inverse error patterns\n\n'
-        textstr += 'Goal: Low correlation = diverse experts'
-        
-        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
-        fig.text(0.5, -0.08, textstr, ha='center', fontsize=10,
-                bbox=props, transform=fig.transFigure)
-        
-        plt.tight_layout(rect=[0, 0.05, 1, 1])
-        
+        # Save as PNG and PDF
         plot_path = output_path / 'error_correlation_matrix.png'
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plot_path_pdf = output_path / 'error_correlation_matrix.pdf'
+        plt.savefig(plot_path_pdf, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"📊 Saved error correlation matrix to: {plot_path}")
+        print(f"📊 Saved error correlation matrix to: {plot_path.absolute()}")
     
     # Prepare results
     results = {
         'engine_names': available_names,
-        'pearson_correlation': corr_matrix_pearson,
         'spearman_correlation': corr_matrix_spearman,
-        'error_means': {name: df[f'{name}_Error'].mean() for name in available_names},
-        'error_stds': {name: df[f'{name}_Error'].std() for name in available_names}
+        'error_means': {name: error_data[:, i].mean() for i, name in enumerate(available_names)},
+        'error_stds': {name: error_data[:, i].std() for i, name in enumerate(available_names)},
+        'num_samples': error_data.shape[0]
     }
     
     return results
@@ -1534,10 +1640,10 @@ def print_case_study_report(df, best_cases, general_catastrophe, dynamicbind_cat
         print("="*100)
         
         engine_names = error_corr_stats['engine_names']
-        pearson = error_corr_stats['pearson_correlation']
+        spearman = error_corr_stats['spearman_correlation']
         
         # Print correlation matrix (lower triangle only)
-        print("\nPearson Correlation Matrix (Lower Triangle):")
+        print("\nSpearman Correlation Matrix (Lower Triangle):")
         print(f"{'Engine':<15}", end="")
         for name in engine_names:
             print(f"{name:<12}", end="")
@@ -1550,7 +1656,7 @@ def print_case_study_report(df, best_cases, general_catastrophe, dynamicbind_cat
                 if i == j:
                     print(f"{'1.000':<12}", end="")
                 elif i > j:  # Lower triangle only
-                    print(f"{pearson[i, j]:<12.3f}", end="")
+                    print(f"{spearman[i, j]:<12.3f}", end="")
                 else:
                     print(f"{'':<12}", end="")
             print()
@@ -1571,7 +1677,7 @@ def print_case_study_report(df, best_cases, general_catastrophe, dynamicbind_cat
                 if i < j:
                     i_idx = engine_names.index(n1)
                     j_idx = engine_names.index(n2)
-                    corr_val = pearson[max(i_idx, j_idx), min(i_idx, j_idx)]
+                    corr_val = spearman[max(i_idx, j_idx), min(i_idx, j_idx)]
                     if corr_val < min_corr:
                         min_corr = corr_val
                         min_pair = (n1, n2)
@@ -1592,7 +1698,7 @@ def print_case_study_report(df, best_cases, general_catastrophe, dynamicbind_cat
             max_expert = None
             for i, name in enumerate(engine_names):
                 if name != 'MoNIG':
-                    corr_val = pearson[max(monig_idx, i), min(monig_idx, i)]
+                    corr_val = spearman[max(monig_idx, i), min(monig_idx, i)]
                     if corr_val > max_corr_with_monig:
                         max_corr_with_monig = corr_val
                         max_expert = name
@@ -1813,7 +1919,7 @@ def analyze_baseline_risk_coverage(experiment_dir, seed, output_dir=None):
     """
     Quick baseline comparison for risk-coverage at the same seed.
     Shows MoNIG vs baselines side-by-side.
-    Generates risk-coverage comparison plots.
+    Generates risk-coverage comparison plots - Publication quality.
     """
     from pathlib import Path
     import matplotlib.pyplot as plt
@@ -1874,20 +1980,30 @@ def analyze_baseline_risk_coverage(experiment_dir, seed, output_dir=None):
         }
         mae_curves[model_name] = mae_values
     
-    # Generate plots if output_dir is provided and we have data
+    # Generate plots if output_dir is provided and we have data - Publication quality
     if output_dir and len(results_summary) > 0:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Create figure with 2 subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+        # Publication-quality settings
+        plt.rcParams.update({
+            'font.size': 12,
+            'axes.labelsize': 14,
+            'axes.titlesize': 14,
+            'xtick.labelsize': 12,
+            'ytick.labelsize': 12,
+        })
         
+        # Create figure with 2 subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        
+        # Clean, distinct colors
         colors = {
-            'MoNIG': '#1f77b4',  # blue
-            'Gaussian': '#ff7f0e',  # orange
-            'NIG': '#2ca02c',  # green
-            'DeepEnsemble': '#d62728',  # red
-            'MCDropout': '#9467bd'  # purple
+            'MoNIG': '#2E86AB',     # Blue
+            'Gaussian': '#F18F01',  # Orange
+            'NIG': '#A23B72',       # Magenta
+            'DeepEnsemble': '#C73E1D',  # Red
+            'MCDropout': '#6B4E71'  # Purple
         }
         
         markers = {
@@ -1898,31 +2014,46 @@ def analyze_baseline_risk_coverage(experiment_dir, seed, output_dir=None):
             'MCDropout': 'v'
         }
         
-        # Plot 1: MAE vs Coverage
+        display_names = {
+            'MoNIG': 'CABE',
+            'Gaussian': 'Gaussian',
+            'NIG': 'Evidential Regression',
+            'DeepEnsemble': 'DeepEnsemble',
+            'MCDropout': 'MC Dropout'
+        }
+        
+        # Plot 1: MAE vs Coverage (left panel)
         for model_name, mae_values in mae_curves.items():
-            color = colors.get(model_name, 'gray')
+            color = colors.get(model_name, '#888888')
             marker = markers.get(model_name, 'o')
+            display_name = display_names.get(model_name, model_name)
             
             ax1.plot(coverage_levels * 100, mae_values, 
-                    color=color, marker=marker, markersize=8, linewidth=2.5,
-                    label=f"{model_name}", alpha=0.8)
-            
-            # Add horizontal line for full set
-            ax1.axhline(y=results_summary[model_name]['mae_full'], color=color, 
-                       linestyle='--', alpha=0.3, linewidth=1)
+                    color=color, linewidth=2.5, alpha=0.9,
+                    label=display_name)
+            ax1.scatter(coverage_levels * 100, mae_values,
+                       color=color, marker=marker, s=70, zorder=5, 
+                       edgecolors='white', linewidth=1)
         
-        ax1.set_xlabel('Coverage (% of samples kept)', fontsize=13, fontweight='bold')
-        ax1.set_ylabel('MAE (pKd)', fontsize=13, fontweight='bold')
-        ax1.set_title('Risk-Coverage Curves: MAE vs Coverage\n(Lower = Better)', 
-                     fontsize=15, fontweight='bold')
-        ax1.legend(loc='upper right', fontsize=10, framealpha=0.9)
-        ax1.grid(True, alpha=0.3)
+        ax1.set_xlabel('Coverage (%)', fontsize=14)
+        ax1.set_ylabel('MAE (pKd)', fontsize=14)
+        ax1.legend(loc='upper right', fontsize=10, frameon=True, fancybox=False,
+                   edgecolor='gray', framealpha=0.95)
+        ax1.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+        ax1.set_axisbelow(True)
         ax1.set_xlim(45, 105)
         
-        # Plot 2: Improvement vs Discarded
+        # Clean spines
+        ax1.spines['top'].set_visible(False)
+        ax1.spines['right'].set_visible(False)
+        ax1.spines['left'].set_linewidth(1.2)
+        ax1.spines['bottom'].set_linewidth(1.2)
+        
+        # Plot 2: Improvement vs Discarded (right panel)
         for model_name, mae_values in mae_curves.items():
-            color = colors.get(model_name, 'gray')
+            color = colors.get(model_name, '#888888')
             marker = markers.get(model_name, 'o')
+            display_name = display_names.get(model_name, model_name)
             
             mae_full = results_summary[model_name]['mae_full']
             
@@ -1931,27 +2062,34 @@ def analyze_baseline_risk_coverage(experiment_dir, seed, output_dir=None):
             discard_pcts = 100 - coverage_levels * 100
             
             ax2.plot(discard_pcts, improvements,
-                    color=color, marker=marker, markersize=8, linewidth=2.5,
-                    label=model_name, alpha=0.8)
+                    color=color, linewidth=2.5, alpha=0.9,
+                    label=display_name)
+            ax2.scatter(discard_pcts, improvements,
+                       color=color, marker=marker, s=70, zorder=5,
+                       edgecolors='white', linewidth=1)
         
-        # Add shaded regions
-        ax2.axvspan(0, 20, alpha=0.1, color='green', label='Low risk (≤20% discarded)')
-        ax2.axvspan(20, 50, alpha=0.1, color='yellow')
-        ax2.axvspan(50, 100, alpha=0.1, color='red')
-        
-        ax2.set_xlabel('% of Most Uncertain Samples Discarded', fontsize=13, fontweight='bold')
-        ax2.set_ylabel('MAE Improvement (%)', fontsize=13, fontweight='bold')
-        ax2.set_title('Error Improvement by Selective Prediction\n(Higher = Better)', 
-                     fontsize=15, fontweight='bold')
-        ax2.legend(loc='upper left', fontsize=10, framealpha=0.9)
-        ax2.grid(True, alpha=0.3)
+        ax2.set_xlabel('Discarded (%)', fontsize=14)
+        ax2.set_ylabel('MAE Improvement (%)', fontsize=14)
+        ax2.legend(loc='upper left', fontsize=10, frameon=True, fancybox=False,
+                   edgecolor='gray', framealpha=0.95)
+        ax2.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+        ax2.set_axisbelow(True)
         ax2.set_xlim(-5, 55)
+        
+        # Clean spines
+        ax2.spines['top'].set_visible(False)
+        ax2.spines['right'].set_visible(False)
+        ax2.spines['left'].set_linewidth(1.2)
+        ax2.spines['bottom'].set_linewidth(1.2)
         
         plt.tight_layout()
         
         plot_path = output_path / 'risk_coverage_comparison.png'
-        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
         plt.close()
+        
+        # Reset rcParams
+        plt.rcParams.update(plt.rcParamsDefault)
         
         print(f"📊 Saved risk-coverage comparison plot to: {plot_path}")
         
@@ -1963,13 +2101,31 @@ def analyze_baseline_risk_coverage(experiment_dir, seed, output_dir=None):
 
 def _plot_improvement_heatmap(results_dict, output_dir):
     """
-    Create heatmap showing improvement at different coverage levels.
+    Create heatmap showing improvement at different coverage levels - Publication quality.
     Helper function for analyze_baseline_risk_coverage.
     """
     import matplotlib.pyplot as plt
     
+    # Publication-quality settings
+    plt.rcParams.update({
+        'font.size': 12,
+        'axes.labelsize': 14,
+        'axes.titlesize': 14,
+        'xtick.labelsize': 12,
+        'ytick.labelsize': 12,
+    })
+    
+    display_names = {
+        'MoNIG': 'CABE',
+        'Gaussian': 'Gaussian',
+        'NIG': 'Evidential Regression',
+        'DeepEnsemble': 'DeepEnsemble',
+        'MCDropout': 'MC Dropout'
+    }
+    
     coverage_levels = [50, 70, 90]
     models = []
+    display_models = []
     improvements = []
     
     for model_name, results in results_dict.items():
@@ -1977,6 +2133,7 @@ def _plot_improvement_heatmap(results_dict, output_dir):
             continue
         
         models.append(model_name)
+        display_models.append(display_names.get(model_name, model_name))
         model_improvements = []
         for cov in coverage_levels:
             imp = results['improvements'].get(cov, {}).get('improvement', 0)
@@ -1988,36 +2145,46 @@ def _plot_improvement_heatmap(results_dict, output_dir):
     
     improvements = np.array(improvements)
     
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(6, 3.5))
     
-    im = ax.imshow(improvements, cmap='RdYlGn', aspect='auto', vmin=0, vmax=20)
+    # Use a cleaner colormap
+    im = ax.imshow(improvements, cmap='YlGn', aspect='auto', vmin=0, vmax=max(20, improvements.max()))
     
     # Set ticks
     ax.set_xticks(np.arange(len(coverage_levels)))
     ax.set_yticks(np.arange(len(models)))
-    ax.set_xticklabels([f'{c}%' for c in coverage_levels])
-    ax.set_yticklabels(models)
+    ax.set_xticklabels([f'{c}%' for c in coverage_levels], fontsize=12)
+    ax.set_yticklabels(display_models, fontsize=11)
     
     # Add colorbar
-    cbar = plt.colorbar(im, ax=ax)
-    cbar.set_label('MAE Improvement (%)', fontsize=11, fontweight='bold')
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    cbar.set_label('MAE Improvement (%)', fontsize=12)
+    cbar.ax.tick_params(labelsize=10)
     
     # Add text annotations
     for i in range(len(models)):
         for j in range(len(coverage_levels)):
-            text = ax.text(j, i, f'{improvements[i, j]:.1f}%',
-                          ha="center", va="center", color="black", fontsize=11, fontweight='bold')
+            val = improvements[i, j]
+            # Use white text for dark backgrounds
+            text_color = 'white' if val > 10 else 'black'
+            ax.text(j, i, f'{val:.1f}%',
+                   ha="center", va="center", color=text_color, fontsize=11, fontweight='bold')
     
-    ax.set_xlabel('Coverage (% kept)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Model', fontsize=12, fontweight='bold')
-    ax.set_title('MAE Improvement by Model and Coverage Level\n(Higher = Better Uncertainty Estimates)', 
-                fontsize=14, fontweight='bold')
+    ax.set_xlabel('Coverage', fontsize=14)
+    ax.set_ylabel('Method', fontsize=14)
+    
+    # Remove spines
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     
     plt.tight_layout()
     
     plot_path = Path(output_dir) / 'improvement_heatmap.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close()
+    
+    # Reset rcParams
+    plt.rcParams.update(plt.rcParamsDefault)
     
     print(f"📊 Saved improvement heatmap to: {plot_path}")
 
@@ -2068,7 +2235,7 @@ def analyze_single_csv(csv_path, output_dir=None, original_csv_path='pdbbind_des
     
     # Analyze error correlations between engines
     print("\nAnalyzing error correlations between engines...")
-    error_corr_stats = analyze_error_correlation_matrix(df, num_experts, output_dir)
+    error_corr_stats = analyze_error_correlation_matrix(df, num_experts, output_dir, original_csv_path)
     
     print("Creating pairwise error scatter plots...")
     pairwise_error_stats = analyze_pairwise_error_scatter(df, num_experts, output_dir)

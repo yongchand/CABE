@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
-from src.utils import flatten, unflatten_like
+from src.utils import flatten, unflatten_like, moe_nig
 
 
 class DrugDiscoveryMoNIGEmb(nn.Module):
@@ -252,15 +252,134 @@ class DrugDiscoveryMoNIG_NoContextReliability(DrugDiscoveryMoNIGEmb):
         
         return scaled_nigs
 
+class DrugDiscoveryConsensusScoring(nn.Module):
+    """
+    Exponential Consensus Ranking (ECR) adapted for regression.
 
-class DrugDiscoveryMoNIG_UniformWeightAggregation(DrugDiscoveryMoNIGEmb):
+    Based on: Palacio-Rodriguez et al., "Exponential consensus ranking improves
+    the outcome in docking and receptor ensemble docking", Sci Rep 9, 5142 (2019)
+    https://www.nature.com/articles/s41598-019-41594-3
+
+    Original ECR formula (for ranking): P(i) = (1/σ) * Σ_j exp(-r_ij / σ)
+
+    Adapted for regression:
+    - For each sample, compute median as robust consensus estimate
+    - Weight each expert by exp(-|s_j - consensus| / σ)
+    - Experts closer to consensus get exponentially higher weights
+    - Final prediction = weighted average
+    - Uncertainty = weighted standard deviation
+
+    This is a heuristic baseline with NO learnable parameters.
     """
-    Ablation 4: Use uniform weight aggregation instead of MoNIG aggregation
-    This tests if MoNIG-style aggregation is necessary vs simple averaging.
-    Note: This still uses reliability scaling, but aggregates with uniform weights.
-    """
+    def __init__(self, hyp_params):
+        super(DrugDiscoveryConsensusScoring, self).__init__()
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+        # σ parameter controls how quickly weights decay with disagreement
+        # Typical pKd range is ~2-3 units, so σ=1.0 is reasonable
+        self.sigma = 1.0
+
     def forward(self, expert_scores, embeddings):
-        # Get per-expert NIG params with reliability scaling (same as base)
+        """
+        Forward pass with ECR-style exponential consensus weighting.
+
+        Args:
+            expert_scores: [batch, num_experts] - Docking engine predictions (pKd scale)
+            embeddings: [batch, embedding_dim] - Not used (for interface compatibility)
+
+        Returns:
+            mean: [batch, 1] - Consensus-weighted prediction
+            std: [batch, 1] - Uncertainty based on weighted disagreement
+        """
+        # Compute robust consensus (median across experts for each sample)
+        consensus = expert_scores.median(dim=1, keepdim=True)[0]  # [batch, 1]
+
+        # ECR-style exponential weighting: exp(-|deviation| / sigma)
+        # Experts closer to consensus get higher weights
+        deviation = torch.abs(expert_scores - consensus)  # [batch, num_experts]
+        weights = torch.exp(-deviation / self.sigma)  # [batch, num_experts]
+
+        # Normalize weights to sum to 1
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Weighted mean prediction
+        mean = (weights * expert_scores).sum(dim=1, keepdim=True)
+
+        # Weighted standard deviation as uncertainty
+        squared_diff = (expert_scores - mean) ** 2
+        weighted_var = (weights * squared_diff).sum(dim=1, keepdim=True)
+        std = torch.sqrt(weighted_var + 1e-8)
+
+        return mean, std
+
+
+class DrugDiscoveryEnsembleScoring(nn.Module):
+    """
+    ENS_Score: Simple Ensemble Scoring for binding affinity prediction.
+
+    Based on: Rayka et al., ENS_Score ensemble method
+    https://github.com/miladrayka/ENS_Score
+
+    Method:
+    - Simple arithmetic mean of all expert predictions
+    - Standard deviation as uncertainty measure
+    - ENS_Score = (1/N) × Σ(Expert_i prediction)
+
+    This is the most common ensemble approach in drug discovery and
+    achieved Rp=0.842 on CASF-2016 benchmark.
+
+    This is a heuristic baseline with NO learnable parameters.
+    """
+    def __init__(self, hyp_params):
+        super(DrugDiscoveryEnsembleScoring, self).__init__()
+        self.num_experts = hyp_params.num_experts
+        self.embedding_dim = hyp_params.embedding_dim
+
+    def forward(self, expert_scores, embeddings):
+        """
+        Forward pass with simple averaging (ENS_Score style).
+
+        Args:
+            expert_scores: [batch, num_experts] - Docking engine predictions (pKd scale)
+            embeddings: [batch, embedding_dim] - Not used (for interface compatibility)
+
+        Returns:
+            mean: [batch, 1] - Simple average of engine predictions
+            std: [batch, 1] - Standard deviation across engines (uncertainty)
+        """
+        # ENS_Score: Simple arithmetic mean
+        mean = expert_scores.mean(dim=1, keepdim=True)
+
+        # Standard deviation as uncertainty (prediction confidence)
+        std = expert_scores.std(dim=1, keepdim=True)
+
+        # Ensure non-zero std for numerical stability
+        std = torch.clamp(std, min=1e-6)
+
+        return mean, std
+
+
+class DrugDiscoveryMoNIG_ScoresOnlyReliability(DrugDiscoveryMoNIGEmb):
+    """
+    Ablation: Reliability network takes only engine scores, not h(x) embeddings.
+    
+    r_i(x) = g_phi([s1, s2, s3, s4])_i
+    
+    This tests whether the embeddings h(x) contribute to reliability estimation,
+    or if the engine scores alone are sufficient.
+    """
+    def __init__(self, hyp_params):
+        super().__init__(hyp_params)
+        # Override reliability net to take only engine scores (not embeddings)
+        self.reliability_net = nn.Sequential(
+            nn.Linear(self.num_experts, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.num_experts),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params (same as base)
         nigs = []
         for i in range(self.num_experts):
             expert_i = expert_scores[:, i:i+1]
@@ -275,8 +394,10 @@ class DrugDiscoveryMoNIG_UniformWeightAggregation(DrugDiscoveryMoNIGEmb):
             beta = self.evidence(logbeta)
             nigs.append((mu, v, alpha, beta))
         
-        # Apply reliability scaling (keep this)
-        reliability_scores = self.reliability_net(embeddings)
+        # ABLATION: Reliability from scores only (ignore embeddings)
+        reliability_scores = self.reliability_net(expert_scores)  # [batch, num_experts]
+        
+        # Apply scaling with scores-only reliability
         scaled_nigs = []
         for i in range(self.num_experts):
             mu, v, alpha, beta = nigs[i]
@@ -286,21 +407,50 @@ class DrugDiscoveryMoNIG_UniformWeightAggregation(DrugDiscoveryMoNIGEmb):
             beta_scaled = beta * r_j
             scaled_nigs.append((mu, v_scaled, alpha_scaled, beta_scaled))
         
-        # ABLATION: Use uniform weight aggregation instead of MoNIG
-        # Simple average of means and uncertainty parameters
-        mus = torch.stack([nig[0] for nig in scaled_nigs], dim=0)  # [num_experts, batch, 1]
-        vs = torch.stack([nig[1] for nig in scaled_nigs], dim=0)
-        alphas = torch.stack([nig[2] for nig in scaled_nigs], dim=0)
-        betas = torch.stack([nig[3] for nig in scaled_nigs], dim=0)
-        
-        mu_avg = mus.mean(dim=0)  # [batch, 1]
-        v_avg = vs.mean(dim=0)
-        alpha_avg = alphas.mean(dim=0)
-        beta_avg = betas.mean(dim=0)
-        
-        # Return as list for compatibility (but only one element)
-        return [(mu_avg, v_avg, alpha_avg, beta_avg)]
+        return scaled_nigs
 
+
+class DrugDiscoveryMoNIG_UniformWeightAggregation(DrugDiscoveryMoNIGEmb):
+    """
+    Ablation: Uniform weight aggregation (no learned reliability).
+
+    Tests the importance of learned reliability by using r_j = 1 for all experts
+    (i.e., all experts are equally "reliable") and then applying proper MoNIG aggregation.
+
+    This is different from the full MoNIG which learns context-dependent reliability.
+    """
+    def forward(self, expert_scores, embeddings):
+        # Get per-expert NIG params (without reliability scaling)
+        nigs = []
+        for i in range(self.num_experts):
+            expert_i = expert_scores[:, i:i+1]
+            head = self.evidential_heads[i]
+            fused = head['fusion'](expert_i)
+            mu = head['mu_head'](fused)
+            logv = head['v_head'](fused)
+            logalpha = head['alpha_head'](fused)
+            logbeta = head['beta_head'](fused)
+            v = self.evidence(logv)
+            alpha = self.evidence(logalpha) + 1
+            beta = self.evidence(logbeta)
+            nigs.append((mu, v, alpha, beta))
+
+        # Apply proper MoNIG aggregation (Equation 9) with uniform weights
+        # This is mathematically correct aggregation of NIG distributions
+        mu_final, v_final, alpha_final, beta_final = nigs[0]
+        for i in range(1, len(nigs)):
+            mu_i, v_i, alpha_i, beta_i = nigs[i]
+            # MoNIG aggregation formula
+            mu_new = (v_final * mu_final + v_i * mu_i) / (v_final + v_i + 1e-8)
+            v_new = v_final + v_i
+            alpha_new = alpha_final + alpha_i + 0.5
+            beta_new = (beta_final + beta_i +
+                       0.5 * (v_final * (mu_final - mu_new) ** 2 +
+                              v_i * (mu_i - mu_new) ** 2))
+            mu_final, v_final, alpha_final, beta_final = mu_new, v_new, alpha_new, beta_new
+
+        # Return as list for compatibility with training code
+        return [(mu_final, v_final, alpha_final, beta_final)]
 
 class DrugDiscoveryNIGEmb(nn.Module):
     """
@@ -494,19 +644,27 @@ class DrugDiscoveryDeepEnsemble(nn.Module):
 
 class DrugDiscoveryMCDropout(nn.Module):
     """
-    Monte Carlo Dropout: Uses dropout at inference time for uncertainty estimation
+    Monte Carlo Dropout with Heteroscedastic Output
+
+    Combines MC Dropout for epistemic uncertainty with learned aleatoric uncertainty.
+    The model predicts both mean and variance, and uses dropout sampling at inference.
+
+    Total uncertainty = aleatoric (learned) + epistemic (from MC sampling)
+
+    Reference: Kendall & Gal, "What Uncertainties Do We Need in Bayesian Deep Learning
+               for Computer Vision?", NeurIPS 2017
     """
     def __init__(self, hyp_params):
         super(DrugDiscoveryMCDropout, self).__init__()
-        
+
         self.expert_dim = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
         self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
         self.dropout = hyp_params.dropout if hasattr(hyp_params, 'dropout') else 0.2
         self.num_samples = hyp_params.num_mc_samples if hasattr(hyp_params, 'num_mc_samples') else 50
-        
-        # Use same architecture as Baseline but with dropout enabled at inference
-        self.model = nn.Sequential(
+
+        # Shared encoder with dropout
+        self.encoder = nn.Sequential(
             nn.Linear(self.expert_dim + self.embedding_dim, 512),
             nn.ReLU(),
             nn.Dropout(self.dropout),
@@ -519,47 +677,79 @@ class DrugDiscoveryMCDropout(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Dropout(self.dropout),
-            nn.Linear(64, 1)
         )
-    
+
+        # Separate heads for mean and variance (heteroscedastic)
+        self.mu_head = nn.Linear(64, 1)
+        self.logvar_head = nn.Linear(64, 1)  # Log variance for numerical stability
+
+    def forward_single(self, x):
+        """Single forward pass returning mean and variance."""
+        encoded = self.encoder(x)
+        mu = self.mu_head(encoded)
+        log_var = self.logvar_head(encoded)
+        var = F.softplus(log_var) + 1e-6  # Ensure positive variance
+        return mu, var
+
     def forward(self, expert_scores, embeddings, num_samples=None):
         """
         Forward pass with Monte Carlo sampling
-        
+
         Args:
             expert_scores: [batch, num_experts]
             embeddings: [batch, embedding_dim]
             num_samples: Number of MC samples (default: self.num_samples)
-        
+
         Returns:
             mean: mean prediction [batch, 1]
-            std: standard deviation [batch, 1]
+            std: total uncertainty (aleatoric + epistemic) [batch, 1]
         """
         if num_samples is None:
             num_samples = self.num_samples
-        
-        # Save current training state and temporarily enable training mode for MC sampling
-        # This ensures dropout is active during inference while preserving the original mode
+
+        # Enable dropout for MC sampling
         was_training = self.training
         self.train()
-        
+
         x = torch.cat([expert_scores, embeddings], dim=1)
-        predictions = []
-        
+        means = []
+        variances = []
+
         for _ in range(num_samples):
-            pred = self.model(x)  # [batch, 1]
-            predictions.append(pred)
-        
+            mu, var = self.forward_single(x)
+            means.append(mu)
+            variances.append(var)
+
         # Restore original training state
         if not was_training:
             self.eval()
-        
-        # Stack and compute statistics
-        pred_stack = torch.stack(predictions, dim=0)  # [num_samples, batch, 1]
-        mean = pred_stack.mean(dim=0)  # [batch, 1]
-        std = pred_stack.std(dim=0)  # [batch, 1]
-        
-        return mean, std
+
+        # Stack predictions
+        means_stack = torch.stack(means, dim=0)  # [num_samples, batch, 1]
+        variances_stack = torch.stack(variances, dim=0)  # [num_samples, batch, 1]
+
+        # Compute final mean
+        mean = means_stack.mean(dim=0)  # [batch, 1]
+
+        # Total uncertainty using law of total variance:
+        # Var[Y] = E[Var[Y|θ]] + Var[E[Y|θ]]
+        # aleatoric = E[σ²(θ)] - average predicted variance
+        # epistemic = Var[μ(θ)] - variance of predicted means (from dropout)
+        aleatoric = variances_stack.mean(dim=0)  # [batch, 1]
+        epistemic = means_stack.var(dim=0)  # [batch, 1]
+
+        total_std = torch.sqrt(aleatoric + epistemic + 1e-8)
+
+        return mean, total_std
+
+    def train_forward(self, expert_scores, embeddings):
+        """
+        Forward pass for training (single pass, returns mean and variance).
+
+        Use this during training with Gaussian NLL loss.
+        """
+        x = torch.cat([expert_scores, embeddings], dim=1)
+        return self.forward_single(x)
 
 
 class DrugDiscoverySoftmaxMoE(nn.Module):
@@ -720,24 +910,23 @@ class DrugDiscoveryDeepEnsembleMVE(nn.Module):
         return mean, std
 
 
-class DrugDiscoveryCFGP(nn.Module):
+class DrugDiscoverySVGP(nn.Module):
     """
-    Convolutional-Fed Gaussian Process (CFGP)
-    
+    Sparse Variational Gaussian Process (SVGP) with Deep Kernel Learning
+
     Combines neural network feature extraction with Gaussian Process for
     principled uncertainty quantification.
-    
+
     Architecture:
     - Feature Extractor: Deep MLP processes expert scores + embeddings → latent features
-    - Gaussian Process: GP layer on top of features for uncertainty estimation
-    - Uses sparse GP approximation with inducing points for scalability
-    
+    - Gaussian Process: Sparse variational GP layer on top of features for uncertainty estimation
+    - Uses inducing points for scalability (O(nm²) instead of O(n³))
+
     Reference: Wilson et al., "Deep Kernel Learning", AISTATS 2016
-               van Amersfoort et al., "Uncertainty Estimation Using a Single Deep 
-               Deterministic Neural Network", ICML 2020
+               Hensman et al., "Scalable Variational Gaussian Process Classification", AISTATS 2015
     """
     def __init__(self, hyp_params):
-        super(DrugDiscoveryCFGP, self).__init__()
+        super(DrugDiscoverySVGP, self).__init__()
         
         self.expert_dim = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
@@ -747,32 +936,39 @@ class DrugDiscoveryCFGP(nn.Module):
         self.num_inducing = hyp_params.num_inducing if hasattr(hyp_params, 'num_inducing') else 128
         
         # Feature extractor: Maps inputs to latent space
+        # NOTE: No dropout here! Dropout causes train/eval distribution mismatch
+        # which breaks GP uncertainty estimation. The GP sees different feature
+        # distributions at train vs test time, leading to poor calibration.
+        # Use weight decay for regularization instead.
         self.feature_extractor = nn.Sequential(
             nn.Linear(self.expert_dim + self.embedding_dim, 512),
             nn.ReLU(),
-            nn.Dropout(self.dropout),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Dropout(self.dropout),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(self.dropout),
             nn.Linear(128, self.feature_dim),
         )
         
         # GP parameters
         # Inducing points: learnable "representative" points in feature space
+        # Initialize with spread matching typical neural network activations
         self.inducing_points = nn.Parameter(
-            torch.randn(self.num_inducing, self.feature_dim) * 0.1
+            torch.randn(self.num_inducing, self.feature_dim) * 0.5
         )
-        
-        # GP hyperparameters
-        self.log_lengthscale = nn.Parameter(torch.zeros(1))  # RBF kernel lengthscale
-        self.log_outputscale = nn.Parameter(torch.zeros(1))  # Output scale
-        self.log_noise = nn.Parameter(torch.log(torch.tensor(0.1)))  # Observation noise
-        
+
+        # GP hyperparameters - better initialization for 64-dim feature space
+        # Lengthscale: sqrt(feature_dim) is a reasonable starting point
+        init_lengthscale = np.sqrt(self.feature_dim)  # ~8 for 64 dims
+        self.log_lengthscale = nn.Parameter(torch.log(torch.tensor(init_lengthscale)))
+        # Output scale: initialize to 1.0
+        self.log_outputscale = nn.Parameter(torch.zeros(1))
+        # Observation noise: initialize to reasonable value
+        self.log_noise = nn.Parameter(torch.log(torch.tensor(0.5)))
+
         # Inducing point outputs (variational parameters)
         self.inducing_mean = nn.Parameter(torch.zeros(self.num_inducing, 1))
+        # Initialize inducing variance to allow uncertainty
         self.inducing_log_var = nn.Parameter(torch.zeros(self.num_inducing, 1))
         
     def rbf_kernel(self, x1, x2):
@@ -840,52 +1036,69 @@ class DrugDiscoveryCFGP(nn.Module):
             K_mm = K_mm + torch.eye(self.num_inducing, device=K_mm.device) * 1e-3
             L_mm = torch.linalg.cholesky(K_mm)
         
-        # Solve K_mm^-1 @ K_mn using Cholesky
+        # Compute alpha = K_mm^-1 @ K_mn for predictions
         K_mn = K_nm.t()  # [m, batch]
-        A = torch.cholesky_solve(K_mn, L_mm)  # K_mm^-1 @ K_mn: [m, batch]
-        
-        # Predictive mean: K_nm @ K_mm^-1 @ inducing_mean
-        mean = torch.mm(K_nm, torch.cholesky_solve(self.inducing_mean, L_mm))  # [batch, 1]
-        
-        # Predictive variance (epistemic + aleatoric)
-        # Epistemic: K_nn - K_nm @ K_mm^-1 @ K_mn
+        alpha = torch.cholesky_solve(K_mn, L_mm)  # K_mm^-1 @ K_mn: [m, batch]
+
+        # Predictive mean: K_nm @ K_mm^-1 @ inducing_mean = alpha.T @ inducing_mean
+        alpha_mean = torch.cholesky_solve(self.inducing_mean, L_mm)  # K_mm^-1 @ m: [m, 1]
+        mean = torch.mm(K_nm, alpha_mean)  # [batch, 1]
+
+        # Predictive variance for SVGP:
+        # Var[f*] = K** - K*m @ Kmm^-1 @ Km* + K*m @ Kmm^-1 @ S @ Kmm^-1 @ Km*
+        #         = K** - alpha.T @ Km* + alpha.T @ S @ alpha
+        # where S = diag(inducing_var)
+
         inducing_var = F.softplus(self.inducing_log_var)  # [m, 1]
-        
-        # Variance due to inducing point uncertainty
-        var_inducing = (K_nm ** 2) @ inducing_var  # [batch, 1]
-        
-        # Variance due to GP uncertainty (epistemic)
-        var_epistemic = K_nn_diag - (K_nm * torch.mm(K_nm, torch.cholesky_solve(torch.eye(self.num_inducing, device=K_mm.device), L_mm))).sum(dim=1, keepdim=True)
-        var_epistemic = torch.clamp(var_epistemic, min=0.0)  # [batch, 1]
-        
+
+        # Term 1: Prior variance K** (diagonal) = outputscale for RBF
+        # Term 2: Reduction from conditioning on inducing points
+        # K*m @ Kmm^-1 @ Km* = sum over diagonal of (K_nm @ alpha)
+        # For diagonal: (K_nm * alpha.T).sum(dim=1) = (K_nm @ Kmm^-1 @ Kmn)_diag
+        var_reduction = (K_nm * alpha.t()).sum(dim=1, keepdim=True)  # [batch, 1]
+
+        # Term 3: Variance from inducing point uncertainty
+        # K*m @ Kmm^-1 @ S @ Kmm^-1 @ Km* = alpha.T @ S @ alpha (diagonal)
+        # For diagonal S: sum_j( alpha[j,:]^2 * S[j,j] ) = (alpha^2).T @ inducing_var
+        var_inducing = torch.mm(alpha.t() ** 2, inducing_var)  # [batch, 1]
+
+        # Epistemic variance: K** - K*m @ Kmm^-1 @ Km* + variational term
+        var_epistemic = K_nn_diag - var_reduction + var_inducing
+        var_epistemic = torch.clamp(var_epistemic, min=1e-6)  # [batch, 1]
+
         # Observation noise (aleatoric)
         noise = F.softplus(self.log_noise) + 1e-6
-        
+
         # Total variance
-        total_var = var_epistemic + var_inducing + noise
-        std = torch.sqrt(total_var + 1e-6)  # [batch, 1]
+        total_var = var_epistemic + noise
+        std = torch.sqrt(total_var)  # [batch, 1]
         
         if compute_loss_terms:
             # KL divergence: KL(q(u) || p(u)) for variational inference
             # q(u) = N(inducing_mean, diag(inducing_var))
             # p(u) = N(0, K_mm)
-            
-            # KL = 0.5 * (tr(K_mm^-1 @ Sigma_q) + mean_q^T @ K_mm^-1 @ mean_q - k + log(det(K_mm)/det(Sigma_q)))
+            #
+            # KL = 0.5 * (tr(K_mm^-1 @ S) + m^T @ K_mm^-1 @ m - k + log(det(K_mm)) - log(det(S)))
+
             K_mm_inv_mean = torch.cholesky_solve(self.inducing_mean, L_mm)  # [m, 1]
-            
-            # Trace term
-            K_mm_inv_diag = torch.diagonal(torch.cholesky_solve(torch.eye(self.num_inducing, device=K_mm.device), L_mm))  # [m]
+
+            # Trace term: tr(K_mm^-1 @ S) where S = diag(inducing_var)
+            K_mm_inv_diag = torch.diagonal(torch.cholesky_solve(
+                torch.eye(self.num_inducing, device=K_mm.device), L_mm))  # [m]
             trace_term = (K_mm_inv_diag * inducing_var.squeeze()).sum()
-            
-            # Quadratic term
+
+            # Quadratic term: m^T @ K_mm^-1 @ m
             quad_term = (self.inducing_mean.squeeze() * K_mm_inv_mean.squeeze()).sum()
-            
-            # Log det terms
+
+            # Log det of K_mm (from Cholesky: log det = 2 * sum of log diagonal of L)
             log_det_K_mm = 2 * torch.diagonal(L_mm).log().sum()
-            log_det_Sigma_q = self.inducing_log_var.sum()
-            
+
+            # Log det of S = diag(inducing_var) = sum of log(inducing_var)
+            # Note: inducing_var = softplus(inducing_log_var), so we need log(softplus(...))
+            log_det_Sigma_q = torch.log(inducing_var.squeeze() + 1e-8).sum()
+
             kl_div = 0.5 * (trace_term + quad_term - self.num_inducing + log_det_K_mm - log_det_Sigma_q)
-            
+
             return mean, std, kl_div
         
         return mean, std
@@ -1078,14 +1291,13 @@ class SWAG(torch.nn.Module):
 
         # update sample with mean and scale
         sample = mean + scale_sqrt * rand_sample
-        sample = sample.unsqueeze(0)
 
         # unflatten new sample like the mean sample
         samples_list = unflatten_like(sample, mean_list)
 
-        # Determine device from first parameter
-        device = next(self.base.parameters()).device
-        
+        # Determine device from the mean buffers (parameters were replaced with buffers)
+        device = mean_list[0].device if mean_list else torch.device('cpu')
+
         for (module, name), sample in zip(self.params, samples_list):
             module.__setattr__(name, sample.to(device))
 
@@ -1139,13 +1351,23 @@ class SWAG(torch.nn.Module):
 class DrugDiscoverySWAG(nn.Module):
     """
     SWAG model for Drug Discovery.
-    
+
     Uses SWAG to approximate the posterior distribution over model weights.
     Base model is a Gaussian model (predicts mean and variance).
+
+    Training procedure:
+    1. Train base_model with standard optimizer using train_forward()
+    2. After initial training, periodically call collect_model() during SWA phase
+    3. At inference, forward() samples from the approximate posterior
+
+    Note: SWAG requires a separate trainable model because the SWAG wrapper
+    removes parameters and replaces them with buffers for statistics tracking.
+
+    Reference: Maddox et al., "A Simple Baseline for Bayesian Inference in Deep Learning", NeurIPS 2019
     """
     def __init__(self, hyp_params):
         super(DrugDiscoverySWAG, self).__init__()
-        
+
         self.expert_dim = hyp_params.num_experts
         self.embedding_dim = hyp_params.embedding_dim
         self.hidden_dim = hyp_params.hidden_dim if hasattr(hyp_params, 'hidden_dim') else 256
@@ -1153,55 +1375,102 @@ class DrugDiscoverySWAG(nn.Module):
         self.max_num_models = hyp_params.max_num_models if hasattr(hyp_params, 'max_num_models') else 20
         self.no_cov_mat = hyp_params.no_cov_mat if hasattr(hyp_params, 'no_cov_mat') else True
         self.num_samples = hyp_params.num_swag_samples if hasattr(hyp_params, 'num_swag_samples') else 30
-        
-        # Create base Gaussian model first
+
+        # Store hyp_params for creating base model
+        self._hyp_params = hyp_params
+
+        # Trainable base model - this is what we actually train
+        # Keep this separate because SWAG wrapper removes parameters
         self.base_model = DrugDiscoveryGaussianEmb(hyp_params)
-        
-        # Create SWAG wrapper around Gaussian model
+
+        # SWAG wrapper for collecting statistics and sampling
+        # Note: SWAG removes parameters from its internal base and replaces with buffers
         self.swag = SWAG(
-            base=lambda *args, **kwargs: DrugDiscoveryGaussianEmb(hyp_params),
+            base=DrugDiscoveryGaussianEmb,
             no_cov_mat=self.no_cov_mat,
-            max_num_models=self.max_num_models
+            max_num_models=self.max_num_models,
+            hyp_params=hyp_params
         )
-    
+
+    def get_base_model(self):
+        """
+        Get the trainable base model.
+
+        Use this model's parameters for the optimizer.
+        Train using train_forward(), then call collect_model() periodically.
+        """
+        return self.base_model
+
     def forward(self, expert_scores, embeddings, num_samples=None):
         """
         Forward pass with SWAG sampling.
-        
+
         Args:
             expert_scores: [batch, num_experts]
             embeddings: [batch, embedding_dim]
             num_samples: Number of SWAG samples (default: self.num_samples)
-        
+
         Returns:
             mean: mean prediction [batch, 1]
-            std: standard deviation [batch, 1]
+            std: total uncertainty (aleatoric + epistemic) [batch, 1]
         """
-        # If no models collected yet, use base model directly
+        # If no models collected yet, use base model directly (pre-SWA phase)
         if self.swag.n_models.item() == 0:
-            mu, sigma = self.base_model(expert_scores, embeddings)
-            return mu, torch.sqrt(sigma)
-        
+            mu, sigma_sq = self.base_model(expert_scores, embeddings)
+            return mu, torch.sqrt(sigma_sq + 1e-8)
+
         if num_samples is None:
             num_samples = self.num_samples
-        
-        predictions = []
-        
+
+        means = []
+        variances = []
+
         for _ in range(num_samples):
             # Sample weights from SWAG posterior
             self.swag.sample(scale=1.0, cov=not self.no_cov_mat, fullrank=True)
-            
-            # Get prediction with sampled weights
-            mu, sigma = self.swag(expert_scores, embeddings)
-            predictions.append(mu)
-        
-        # Stack and compute statistics
-        pred_stack = torch.stack(predictions, dim=0)  # [num_samples, batch, 1]
-        mean = pred_stack.mean(dim=0)  # [batch, 1]
-        std = pred_stack.std(dim=0)  # [batch, 1]
-        
+
+            # Get prediction with sampled weights (mu and aleatoric variance)
+            mu, sigma_sq = self.swag(expert_scores, embeddings)
+            means.append(mu)
+            variances.append(sigma_sq)
+
+        # Stack predictions
+        means_stack = torch.stack(means, dim=0)  # [num_samples, batch, 1]
+        variances_stack = torch.stack(variances, dim=0)  # [num_samples, batch, 1]
+
+        # Compute ensemble mean
+        mean = means_stack.mean(dim=0)  # [batch, 1]
+
+        # Compute total uncertainty using law of total variance:
+        # Var[Y] = E[Var[Y|θ]] + Var[E[Y|θ]]
+        # aleatoric = E[σ²(θ)] - average predicted variance across weight samples
+        # epistemic = Var[μ(θ)] - variance of predicted means across weight samples
+        aleatoric = variances_stack.mean(dim=0)  # [batch, 1]
+        epistemic = means_stack.var(dim=0)  # [batch, 1]
+
+        # Total uncertainty
+        total_variance = aleatoric + epistemic
+        std = torch.sqrt(torch.clamp(total_variance, min=1e-8))
+
         return mean, std
-    
-    def collect_model(self, base_model):
-        """Collect a model snapshot for SWAG statistics."""
-        self.swag.collect_model(base_model)
+
+    def collect_model(self):
+        """
+        Collect current base_model weights for SWAG statistics.
+
+        Call this periodically during the SWA phase of training
+        (after initial convergence, with cyclical or constant learning rate).
+        """
+        self.swag.collect_model(self.base_model)
+
+    def train_forward(self, expert_scores, embeddings):
+        """
+        Forward pass for training (no sampling, uses trainable base_model).
+
+        Use this during the training phase before collecting SWAG statistics.
+
+        Returns:
+            mu: predicted mean [batch, 1]
+            sigma_sq: predicted variance [batch, 1]
+        """
+        return self.base_model(expert_scores, embeddings)

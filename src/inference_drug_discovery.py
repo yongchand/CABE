@@ -17,9 +17,11 @@ from src.drug_models_emb import (
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
     DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
     DrugDiscoveryMoNIG_NoContextReliability, DrugDiscoveryMoNIG_UniformWeightAggregation,
+    DrugDiscoveryMoNIG_ScoresOnlyReliability,
     DrugDiscoverySoftmaxMoE,
     DrugDiscoveryDeepEnsembleMVE,
-    DrugDiscoveryCFGP, DrugDiscoverySWAG
+    DrugDiscoverySVGP, DrugDiscoverySWAG,
+    DrugDiscoveryConsensusScoring, DrugDiscoveryEnsembleScoring
 )
 from src.utils import moe_nig
 
@@ -234,7 +236,7 @@ def inference_general(model, loader, device, model_type, expert_indices=None):
             embeddings = embeddings.to(device)
             labels = labels.cpu().numpy()
             
-            if model_type in ['DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
+            if model_type in ['DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG', 'ConsensusScoring', 'EnsembleScoring']:
                 mu, std = model(expert_scores, embeddings)
                 predictions = mu.cpu().numpy()
                 uncertainties = std.cpu().numpy()
@@ -291,7 +293,8 @@ def main():
     # Model config (must match training)
     parser.add_argument('--model_type', type=str, default=None,
                        choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
-                                'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                                'SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG',
+                                'ConsensusScoring', 'EnsembleScoring'],
                        help='Model type (auto-detected from model_path if not provided)')
     parser.add_argument('--hidden_dim', type=int, default=256,
                        help='Hidden dimension (must match training)')
@@ -302,7 +305,7 @@ def main():
     parser.add_argument('--num_mc_samples', type=int, default=50,
                        help='Number of MC samples for MCDropout')
     parser.add_argument('--num_inducing', type=int, default=128,
-                       help='Number of inducing points for CFGP (must match training)')
+                       help='Number of inducing points for SVGP (must match training)')
     parser.add_argument('--max_num_models', type=int, default=20,
                        help='Maximum number of models for SWAG (must match training)')
     parser.add_argument('--num_swag_samples', type=int, default=30,
@@ -418,14 +421,20 @@ def main():
             args.model_type = 'MoNIG_NoContextReliability'
         elif 'MoNIG_UniformWeightAggregation' in model_name:
             args.model_type = 'MoNIG_UniformWeightAggregation'
+        elif 'MoNIG_ScoresOnlyReliability' in model_name:
+            args.model_type = 'MoNIG_ScoresOnlyReliability'
         elif 'MoNIG_FixedReliability' in model_name:
             args.model_type = 'MoNIG_FixedReliability'
         elif 'SoftmaxMoE' in model_name:
             args.model_type = 'SoftmaxMoE'
         elif 'DeepEnsembleMVE' in model_name:
             args.model_type = 'DeepEnsembleMVE'
-        elif 'CFGP' in model_name:
-            args.model_type = 'CFGP'
+        elif 'ConsensusScoring' in model_name:
+            args.model_type = 'ConsensusScoring'
+        elif 'EnsembleScoring' in model_name:
+            args.model_type = 'EnsembleScoring'
+        elif 'SVGP' in model_name:
+            args.model_type = 'SVGP'
         elif 'SWAG' in model_name:
             args.model_type = 'SWAG'
         elif 'MoNIG' in model_name:
@@ -459,6 +468,8 @@ def main():
         model = DrugDiscoveryMoNIG_NoContextReliability(hyp_params)
     elif args.model_type == 'MoNIG_UniformWeightAggregation':
         model = DrugDiscoveryMoNIG_UniformWeightAggregation(hyp_params)
+    elif args.model_type == 'MoNIG_ScoresOnlyReliability':
+        model = DrugDiscoveryMoNIG_ScoresOnlyReliability(hyp_params)
     elif args.model_type == 'NIG':
         model = DrugDiscoveryNIGEmb(hyp_params)
     elif args.model_type == 'Gaussian':
@@ -476,42 +487,51 @@ def main():
     elif args.model_type == 'DeepEnsembleMVE':
         hyp_params.num_models = args.num_models
         model = DrugDiscoveryDeepEnsembleMVE(hyp_params)
-    elif args.model_type == 'CFGP':
+    elif args.model_type == 'SVGP':
         hyp_params.num_inducing = getattr(args, 'num_inducing', 128)
-        model = DrugDiscoveryCFGP(hyp_params)
+        model = DrugDiscoverySVGP(hyp_params)
     elif args.model_type == 'SWAG':
         hyp_params.max_num_models = getattr(args, 'max_num_models', 20)
         hyp_params.no_cov_mat = True
         hyp_params.num_swag_samples = getattr(args, 'num_swag_samples', 30)
         model = DrugDiscoverySWAG(hyp_params)
+    elif args.model_type == 'ConsensusScoring':
+        # ConsensusScoring is a heuristic with NO learnable parameters
+        model = DrugDiscoveryConsensusScoring(hyp_params)
+    elif args.model_type == 'EnsembleScoring':
+        # EnsembleScoring is a heuristic with NO learnable parameters
+        model = DrugDiscoveryEnsembleScoring(hyp_params)
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
     
     model = model.to(args.device)
-    
-    # Load weights
-    print(f"Loading model weights from {args.model_path}...")
-    try:
-        if args.model_type == 'SWAG':
-            # SWAG models may have special state dict structure
-            state_dict = torch.load(args.model_path, map_location=args.device)
-            model.load_state_dict(state_dict, strict=False)
-        else:
-            state_dict = torch.load(args.model_path, map_location=args.device)
-            # Try strict loading first, fall back to non-strict if it fails
-            try:
-                model.load_state_dict(state_dict, strict=True)
-            except RuntimeError as e:
-                print(f"Warning: Strict loading failed: {e}")
-                print("Attempting non-strict loading...")
+
+    # Load weights (skip for models with no learnable parameters)
+    if args.model_type in ['ConsensusScoring', 'EnsembleScoring']:
+        print(f"{args.model_type} is a heuristic with no learnable parameters - skipping weight loading.")
+    else:
+        print(f"Loading model weights from {args.model_path}...")
+        try:
+            if args.model_type == 'SWAG':
+                # SWAG models may have special state dict structure
+                state_dict = torch.load(args.model_path, map_location=args.device)
                 model.load_state_dict(state_dict, strict=False)
-        model = model.to(args.device)
-        print(f"Model loaded successfully!")
-    except Exception as e:
-        print(f"ERROR: Failed to load model weights: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+            else:
+                state_dict = torch.load(args.model_path, map_location=args.device)
+                # Try strict loading first, fall back to non-strict if it fails
+                try:
+                    model.load_state_dict(state_dict, strict=True)
+                except RuntimeError as e:
+                    print(f"Warning: Strict loading failed: {e}")
+                    print("Attempting non-strict loading...")
+                    model.load_state_dict(state_dict, strict=False)
+            model = model.to(args.device)
+            print(f"Model loaded successfully!")
+        except Exception as e:
+            print(f"ERROR: Failed to load model weights: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
     
     # Run inference
     print("\nRunning inference...")

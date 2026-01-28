@@ -8,19 +8,15 @@ import re
 class DrugDiscoveryDatasetEmb(Dataset):
     """
     Dataset for drug discovery with expert scores and molecular embeddings.
-    
-    Supports:
-    - Using test set IDs from data/test.csv for separate test set
-    - Random 80/20 split ratio (train/valid) after excluding test set
+    Uses explicit train/valid/test splits via PDB ID lists.
     """
-    def __init__(self, csv_path, split='train', train_ratio=0.8, val_ratio=0.2,
-                 seed=42, normalization_stats=None, test_pdb_ids=None):
+    def __init__(self, csv_path, split='train', seed=42, normalization_stats=None,
+                 train_pdb_ids=None, valid_pdb_ids=None, test_pdb_ids=None):
         super(DrugDiscoveryDatasetEmb, self).__init__()
         
         # Load data
         df = pd.read_csv(csv_path)
         
-        # Only print CSV loading info for train split to avoid duplicate output
         if split == 'train':
             print(f"Loaded CSV with {len(df)} rows and {len(df.columns)} columns")
         
@@ -36,149 +32,88 @@ class DrugDiscoveryDatasetEmb(Dataset):
         labels, affinity_valid_mask = self._parse_affinity(df['Binding_Affinity'].values)
         
         # Filter out invalid samples (both affinity parsing and NaN expert scores)
-        # Check for NaN values in expert scores
         expert_nan_mask = ~df[self.expert_cols].isna().any(axis=1).values
         valid_mask = affinity_valid_mask & expert_nan_mask
         
         valid_indices = np.where(valid_mask)[0]
         if split == 'train':
-            affinity_valid_count = np.sum(affinity_valid_mask)
-            print(f"Valid samples after parsing affinity: {affinity_valid_count} / {len(df)} "
-                  f"({affinity_valid_count/len(df)*100:.1f}%)")
-            nan_expert_count = np.sum(~expert_nan_mask)
-            if nan_expert_count > 0:
-                print(f"Filtered out {nan_expert_count} samples with NaN expert scores")
-            print(f"Final valid samples: {len(valid_indices)} / {len(df)} "
-                  f"({len(valid_indices)/len(df)*100:.1f}%)")
+            print(f"Valid samples: {len(valid_indices)} / {len(df)} ({len(valid_indices)/len(df)*100:.1f}%)")
         
         # Extract features for valid samples only
         embeddings = df[emb_cols].values[valid_indices].astype(np.float32)
         expert_scores = df[self.expert_cols].values[valid_indices].astype(np.float32)
         labels = labels[valid_mask]
         complex_ids = df['ComplexID'].values[valid_indices]
-        year_folders = df['YearFolder'].values[valid_indices] if 'YearFolder' in df.columns else None
         
-        # Handle test set: exclude test IDs from train/val, include only for test split
-        if split == 'test':
-            # For test split, we want ONLY test set complexes
-            if test_pdb_ids is None:
-                raise ValueError("Test PDB IDs must be provided for test split")
-            test_set = set(str(pdb_id).lower() for pdb_id in test_pdb_ids)
-            test_mask = np.array([str(cid).lower() in test_set for cid in complex_ids])
-            print(f"Including {np.sum(test_mask)} test samples")
-            
-            if np.sum(test_mask) == 0:
-                raise ValueError("No test samples found in dataset")
-            
-            embeddings = embeddings[test_mask]
-            expert_scores = expert_scores[test_mask]
-            labels = labels[test_mask]
-            complex_ids = complex_ids[test_mask]
-            if year_folders is not None:
-                year_folders = year_folders[test_mask]
-            valid_indices = valid_indices[test_mask]
-            
-            # For test split, we don't need to split - use all samples
-            train_indices = np.array([], dtype=np.int64)
-            val_indices = np.array([], dtype=np.int64)
-            test_indices = np.array([], dtype=np.int64)
-        elif test_pdb_ids is not None:
-            # Exclude test set for train/val splits
-            test_set = set(str(pdb_id).lower() for pdb_id in test_pdb_ids)
-            non_test_mask = np.array([str(cid).lower() not in test_set for cid in complex_ids])
-            if split == 'train':
-                print(f"Excluding {np.sum(~non_test_mask)} test samples")
-            
-            embeddings = embeddings[non_test_mask]
-            expert_scores = expert_scores[non_test_mask]
-            labels = labels[non_test_mask]
-            complex_ids = complex_ids[non_test_mask]
-            if year_folders is not None:
-                year_folders = year_folders[non_test_mask]
-            valid_indices = valid_indices[non_test_mask]
+        # Get the PDB IDs for the requested split
+        if split == 'train':
+            pdb_ids = train_pdb_ids
+        elif split == 'valid':
+            pdb_ids = valid_pdb_ids
+        elif split == 'test':
+            pdb_ids = test_pdb_ids
+        else:
+            raise ValueError(f"Unknown split: {split}. Must be 'train', 'valid', or 'test'")
         
-        # Random split (80/20) for train/val - skip for test split
-        if split != 'test':
-            np.random.seed(seed)
-            n_samples = len(valid_indices)
-            indices = np.random.permutation(n_samples)
-            
-            train_end = int(train_ratio * n_samples)
-            if train_end == 0:
-                train_end = max(1, n_samples)
-            val_end = train_end + int(val_ratio * n_samples)
-            val_end = min(val_end, n_samples)
-            
-            train_indices = indices[:train_end]
-            val_indices = indices[train_end:val_end]
-            test_indices = indices[val_end:]
-            
-            # Only print split info for train split to avoid duplicate output
-            if split == 'train':
-                print(f"Random split: train={len(train_indices)}, valid={len(val_indices)}, test={len(test_indices)}")
+        if pdb_ids is None:
+            raise ValueError(f"PDB IDs must be provided for {split} split")
         
-        # Fit or reuse normalization stats
-        # IMPORTANT: normalization_stats must always come from TRAINING data only
-        # to prevent data leakage. Stats should be computed from train split and
-        # reused for valid/test splits.
+        # Filter to only include PDBs that exist in this split
+        pdb_set = set(str(pdb_id).lower() for pdb_id in pdb_ids)
+        split_mask = np.array([str(cid).lower() in pdb_set for cid in complex_ids])
+        
+        if split == 'train':
+            print(f"Split '{split}': requested {len(pdb_ids)} PDBs, found {np.sum(split_mask)} in data")
+        
+        # Apply filter
+        embeddings = embeddings[split_mask]
+        expert_scores = expert_scores[split_mask]
+        labels = labels[split_mask]
+        complex_ids = complex_ids[split_mask]
+        
+        if len(embeddings) == 0:
+            raise ValueError(f"No samples found for {split} split")
+        
+        # Normalization
         if normalization_stats is not None:
             self.emb_mean = np.asarray(normalization_stats['mean'], dtype=np.float32)
             self.emb_std = np.asarray(normalization_stats['std'], dtype=np.float32)
         else:
-            if split not in ['train']:
+            if split != 'train':
                 raise ValueError("Normalization stats must be provided for non-training splits")
-            if split == 'test':
-                raise ValueError("Normalization stats must be provided for test split (use stats from training)")
-            # Compute normalization stats from TRAINING data only
-            train_embeddings = embeddings[train_indices]
-            self.emb_mean = train_embeddings.mean(axis=0).astype(np.float32)
-            self.emb_std = (train_embeddings.std(axis=0) + 1e-8).astype(np.float32)
+            self.emb_mean = embeddings.mean(axis=0).astype(np.float32)
+            self.emb_std = (embeddings.std(axis=0) + 1e-8).astype(np.float32)
         
-        # Normalize ALL embeddings using training stats (before split selection)
-        # This ensures consistent normalization across all splits
         embeddings = (embeddings - self.emb_mean) / self.emb_std
         
-        # Select indices for current split
-        if split == 'train':
-            idx = train_indices
-        elif split == 'valid':
-            idx = val_indices
-        elif split == 'test':
-            # For test split, use all samples (already filtered above)
-            idx = np.arange(len(embeddings), dtype=np.int64)
-        else:
-            raise ValueError(f"Unknown split: {split}. Must be 'train', 'valid', or 'test'")
-        
         # Store tensors
-        self.embeddings = torch.tensor(embeddings[idx]).cpu()
-        self.expert_scores = torch.tensor(expert_scores[idx]).cpu()
-        self.labels = torch.tensor(labels[idx]).cpu()
-        self.complex_ids = complex_ids[idx]
+        self.embeddings = torch.tensor(embeddings).cpu()
+        self.expert_scores = torch.tensor(expert_scores).cpu()
+        self.labels = torch.tensor(labels).cpu()
+        self.complex_ids = complex_ids
         
         print(f"{split} set: {len(self.labels)} samples")
-        print(f"  Embeddings: {self.embeddings.shape}")
-        print(f"  Expert scores: {self.expert_scores.shape}")
-        if len(self.labels) > 0:
-            print(f"  Label range: [{self.labels.min():.2f}, {self.labels.max():.2f}]")
-        else:
-            print("  Label range: [N/A - empty dataset]")
     
     def _parse_affinity(self, affinity_strings):
         """
         Parse binding affinity from strings like 'Kd=6.67uM', 'Ki=19uM'
         Convert to pKd/pKi values (negative log of molar concentration)
-        
-        Returns:
-            labels: numpy array of parsed values (only valid ones)
-            valid_mask: boolean mask indicating which samples are valid
         """
         labels = []
         valid_mask = []
         
         for s in affinity_strings:
             try:
+                s_str = str(s)
+                
+                # Skip inequality values
+                if '>' in s_str or '<' in s_str:
+                    labels.append(0.0)
+                    valid_mask.append(False)
+                    continue
+                
                 # Extract numeric value and unit
-                match = re.search(r'([0-9.]+)([a-zA-Z]+)', str(s))
+                match = re.search(r'([0-9.]+)([a-zA-Z]+)', s_str)
                 if match:
                     value = float(match.group(1))
                     unit = match.group(2).lower()
@@ -195,28 +130,21 @@ class DrugDiscoveryDatasetEmb(Dataset):
                     elif 'm' in unit:
                         molar = value
                     else:
-                        # Skip if unit is unrecognized
-                        labels.append(0.0)  # Placeholder
+                        labels.append(0.0)
                         valid_mask.append(False)
                         continue
                     
-                    # Convert to pKd/pKi
                     p_value = -np.log10(molar)
                     labels.append(p_value)
                     valid_mask.append(True)
                 else:
-                    # If can't parse, skip this sample
-                    labels.append(0.0)  # Placeholder
+                    labels.append(0.0)
                     valid_mask.append(False)
             except Exception:
-                # If parsing fails, skip this sample
-                labels.append(0.0)  # Placeholder
+                labels.append(0.0)
                 valid_mask.append(False)
         
-        labels = np.array(labels, dtype=np.float32)
-        valid_mask = np.array(valid_mask, dtype=bool)
-        
-        return labels, valid_mask
+        return np.array(labels, dtype=np.float32), np.array(valid_mask, dtype=bool)
     
     def get_dim(self):
         """Return dimensions of embeddings and expert scores"""

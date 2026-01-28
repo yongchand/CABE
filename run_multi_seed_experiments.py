@@ -7,10 +7,10 @@ reproducibility and statistical significance for ICML submission.
 
 Usage:
     # Train new experiments
-    python run_multi_seed_experiments.py --model_types MoNIG CFGP --seeds 42 43 44 45 46 --epochs 150
-    
+    python run_multi_seed_experiments.py --model_types MoNIG SVGP --seeds 42 43 44 45 46 --epochs 150
+
     # Recompute statistics from existing results (no retraining)
-    python run_multi_seed_experiments.py --model_types MoNIG CFGP --seeds 42 43 44 45 46 --recompute-stats
+    python run_multi_seed_experiments.py --model_types MoNIG SVGP --seeds 42 43 44 45 46 --recompute-stats
     
     # Force retrain even if results exist
     python run_multi_seed_experiments.py --model_types MoNIG --seeds 42 --epochs 150 --force-retrain
@@ -20,6 +20,7 @@ import argparse
 import subprocess
 import sys
 import os
+import time
 from pathlib import Path
 import json
 import pandas as pd
@@ -31,19 +32,20 @@ import uncertainty_toolbox as uct
 
 # All available model types
 ALL_MODEL_TYPES = [
+    'SVGP',
+    'SWAG',
     'MoNIG',
     'NIG',
     'Gaussian',
     'Baseline',
-    'DeepEnsemble',
     'MCDropout',
     'DeepEnsembleMVE',
-    'CFGP',
-    'SWAG'
+    'ConsensusScoring', 
+    'EnsembleScoring'
 ]
 
 # Default seeds for experiments
-DEFAULT_SEEDS = [42, 43, 44, 45, 46]
+DEFAULT_SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 
 
 def compute_picp(y_pred, y_std, y_true, coverage=0.95):
@@ -224,7 +226,7 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         cmd.extend(['--num_models', '5'])
     elif model_type == 'MCDropout':
         cmd.extend(['--num_mc_samples', '50'])
-    elif model_type == 'CFGP':
+    elif model_type == 'SVGP':
         cmd.extend(['--num_inducing', '128'])
     elif model_type == 'SWAG':
         cmd.extend(['--num_swag_samples', '30'])
@@ -372,22 +374,25 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         return {}
 
 
-def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim, 
+def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
                 dropout, lr, risk_weight, device, output_dir):
     """
     Run training for a specific model type and seed.
-    
+
     Returns:
-        dict: Results dictionary with success status and output paths
+        dict: Results dictionary with success status, output paths, and runtime
     """
     print(f"\n{'='*80}")
     print(f"Training {model_type} with seed {seed}")
     print(f"{'='*80}")
-    
+
+    # Start timing
+    start_time = time.time()
+
     # Create output directory for this experiment
     exp_dir = Path(output_dir) / f"{model_type}_seed{seed}"
     exp_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Build command
     cmd = [
         sys.executable,
@@ -404,17 +409,17 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
         '--risk_weight', str(risk_weight),
         '--device', device,
     ]
-    
+
     # Add model-specific arguments
     if model_type == 'DeepEnsemble':
         cmd.extend(['--num_models', '5'])
     elif model_type == 'MCDropout':
         cmd.extend(['--num_mc_samples', '50'])
-    elif model_type == 'CFGP':
+    elif model_type == 'SVGP':
         cmd.extend(['--num_inducing', '128'])
     elif model_type == 'SWAG':
         cmd.extend(['--max_num_models', '20', '--swag_start', '75', '--num_swag_samples', '30'])
-    
+
     # Run training
     log_file = exp_dir / 'training.log'
     try:
@@ -426,13 +431,16 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
                 text=True,
                 check=True
             )
-        
+
+        # Calculate training time
+        training_time = time.time() - start_time
+
         # Check if model files were created
         model_path = Path('saved_models') / f'best_{model_type}_emb.pt'
         norm_stats_path = Path('saved_models') / f'best_{model_type}_emb_norm_stats.npz'
-        
+
         success = model_path.exists() and norm_stats_path.exists()
-        
+
         if success:
             # Copy model files to experiment directory
             import shutil
@@ -440,17 +448,22 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
                 shutil.copy(model_path, exp_dir / model_path.name)
             if norm_stats_path.exists():
                 shutil.copy(norm_stats_path, exp_dir / norm_stats_path.name)
-        
+
         result = {
             'success': success,
             'model_type': model_type,
             'seed': seed,
             'log_file': str(log_file),
             'model_path': str(model_path) if success else None,
-            'exp_dir': str(exp_dir)
+            'exp_dir': str(exp_dir),
+            'training_time_sec': training_time,
+            'training_time_min': training_time / 60.0,
         }
-        
+
+        print(f"  Training completed in {training_time:.1f}s ({training_time/60:.2f} min)")
+
         # Run test evaluation if training succeeded
+        inference_start = time.time()
         if success:
             test_results = run_test_evaluation(
                 model_type=model_type,
@@ -461,16 +474,27 @@ def run_training(model_type, seed, csv_path, epochs, batch_size, hidden_dim,
                 output_dir=exp_dir
             )
             result.update(test_results)
-        
+            inference_time = time.time() - inference_start
+            result['inference_time_sec'] = inference_time
+            print(f"  Inference completed in {inference_time:.1f}s")
+
+        # Total time including inference
+        total_time = time.time() - start_time
+        result['total_time_sec'] = total_time
+        result['total_time_min'] = total_time / 60.0
+
         return result
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Training failed with return code {e.returncode}")
+        total_time = time.time() - start_time
+        print(f"ERROR: Training failed with return code {e.returncode} after {total_time:.1f}s")
         return {
             'success': False,
             'model_type': model_type,
             'seed': seed,
             'log_file': str(log_file),
-            'error': str(e)
+            'error': str(e),
+            'total_time_sec': total_time,
+            'total_time_min': total_time / 60.0,
         }
 
 
@@ -517,7 +541,7 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.001,
+    parser.add_argument('--risk_weight', type=float, default=0.0005,
                        help='Risk regularization weight (for NIG/MoNIG)')
     
     # Output
@@ -712,10 +736,16 @@ def save_results_to_csv(results, csv_file):
             'seed': r['seed'],
             'success': r['success'],
         }
-        
+
+        # Add runtime metrics
+        runtime_metrics = ['training_time_sec', 'training_time_min',
+                          'inference_time_sec', 'total_time_sec', 'total_time_min']
+        for metric in runtime_metrics:
+            row[metric] = r.get(metric, np.nan)
+
         # Add test metrics if available
         test_metrics = ['test_mae', 'test_rmse', 'test_corr', 'test_r2',
-                       'test_mean_epistemic', 'test_mean_aleatoric', 
+                       'test_mean_epistemic', 'test_mean_aleatoric',
                        'test_mean_total_uncertainty', 'test_mean_uncertainty',
                        'test_mean_std', 'test_samples',
                        'test_picp_95', 'test_picp_90', 'test_ece',
@@ -723,35 +753,38 @@ def save_results_to_csv(results, csv_file):
                        'test_crps', 'test_nll',
                        'test_conformal_picp', 'test_conformal_avg_width',
                        'test_conformal_coverage_error']
-        
+
         for metric in test_metrics:
             row[metric] = r.get(metric, np.nan)
-        
+
         # Add paths
         row['model_path'] = r.get('model_path', '')
         row['log_file'] = r.get('log_file', '')
         row['exp_dir'] = r.get('exp_dir', '')
-        
+
         # Add error if failed
         if not r['success'] and 'error' in r:
             row['error'] = r['error']
-        
+
         rows.append(row)
-    
+
     # Create DataFrame and save
     df = pd.DataFrame(rows)
-    
+
     # Reorder columns for readability
-    column_order = ['model_type', 'seed', 'success', 'test_samples',
+    column_order = ['model_type', 'seed', 'success',
+                   'training_time_min', 'total_time_min', 'test_samples',
                    'test_mae', 'test_rmse', 'test_corr', 'test_r2',
                    'test_crps', 'test_nll',
                    'test_picp_95', 'test_picp_90', 'test_ece',
                    'test_avg_interval_width_95',
                    'test_conformal_picp', 'test_conformal_avg_width',
                    'test_conformal_coverage_error',
-                   'test_mean_epistemic', 'test_mean_aleatoric', 
+                   'test_mean_epistemic', 'test_mean_aleatoric',
                    'test_mean_total_uncertainty', 'test_mean_uncertainty',
-                   'test_mean_std', 'model_path', 'log_file', 'exp_dir', 'error']
+                   'test_mean_std',
+                   'training_time_sec', 'inference_time_sec', 'total_time_sec',
+                   'model_path', 'log_file', 'exp_dir', 'error']
     
     # Only include columns that exist
     column_order = [col for col in column_order if col in df.columns]
@@ -831,6 +864,17 @@ def save_results_to_csv(results, csv_file):
                 conformal_width_values = model_df['test_conformal_avg_width'].dropna()
                 if len(conformal_width_values) > 0:
                     print(f"    Conformal Width: {conformal_width_values.mean():.4f} ± {conformal_width_values.std():.4f} (n={len(conformal_width_values)})")
+
+            # Runtime metrics
+            if 'training_time_min' in model_df.columns:
+                time_values = model_df['training_time_min'].dropna()
+                if len(time_values) > 0:
+                    print(f"    Training Time: {time_values.mean():.2f} ± {time_values.std():.2f} min (n={len(time_values)})")
+
+            if 'total_time_min' in model_df.columns:
+                total_time_values = model_df['total_time_min'].dropna()
+                if len(total_time_values) > 0:
+                    print(f"    Total Time: {total_time_values.mean():.2f} ± {total_time_values.std():.2f} min (n={len(total_time_values)})")
 
 
 if __name__ == '__main__':

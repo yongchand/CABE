@@ -2,12 +2,20 @@
 """
 Run ablation experiments for CABE (MoNIG) to test different components.
 
+Uses 3 engines: GNINA, FlowDock, DynamicBind (excludes BIND)
+
 Ablations:
-1. MoNIG_NoReliabilityScaling - Remove reliability scaling (r_j = 1.0) → show MoNIG collapses
-2. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts) → show reliability matters
-3. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence) → test context-dependent reliability
-4. MoNIG_UniformWeightAggregation - Use uniform weight aggregation → test MoNIG aggregation necessity
-5. MoNIG (baseline) - Full MoNIG with learned reliability
+1. MoNIG (baseline) - Full MoNIG with learned reliability
+2. MoNIG_NoReliabilityScaling - Remove reliability scaling (r_j = 1.0) → show MoNIG collapses
+3. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts) → show reliability matters
+4. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence) → test context-dependent reliability
+5. MoNIG_UniformWeightAggregation - Use uniform weight aggregation → test MoNIG aggregation necessity
+6. MoNIG_ScoresOnlyReliability - Reliability from scores only (no h(x)) → test if embeddings needed for reliability
+7. MoNIG_ConsensusScoring - Consensus-based reliability (heuristic, no learning) → test if learned reliability beats simple heuristics
+8. MoNIG_EnsembleLearning - Ensemble of MoNIG models → test if ensembling provides better uncertainty
+9. MoNIG_SoftmaxReliability - Use softmax(reliability) instead of independent sigmoids → test normalization strategy
+10. SimpleAggregation - Simple aggregation baseline (mean of experts) → lower bound baseline
+11. Oracle - Oracle upper bound (best expert per sample) → upper bound reference
 
 Usage:
     python run_ablation_experiments.py [--seeds 42 43 44 45 46] [--epochs 150]
@@ -29,7 +37,7 @@ import uncertainty_toolbox as uct
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Default seeds for experiments
-DEFAULT_SEEDS = [42, 43, 44, 45, 46]
+DEFAULT_SEEDS = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51]
 
 # All available ablation types
 ALL_ABLATION_TYPES = [
@@ -38,6 +46,12 @@ ALL_ABLATION_TYPES = [
     'MoNIG_UniformReliability',
     'MoNIG_NoContextReliability',
     'MoNIG_UniformWeightAggregation',
+    'MoNIG_ScoresOnlyReliability',  # Reliability from scores only (no embeddings h(x))
+    'MoNIG_ConsensusScoring',  # Consensus-based reliability (heuristic, no learning)
+    'MoNIG_EnsembleLearning',  # Ensemble of MoNIG models for uncertainty aggregation
+    'MoNIG_SoftmaxReliability',  # Use softmax(reliability) instead of independent sigmoids
+    'SimpleAggregation',  # Simple aggregation baseline (mean of experts)
+    'Oracle',  # Oracle upper bound (best expert per sample)
 ]
 
 
@@ -80,7 +94,7 @@ def run_test_evaluation(model_type, model_path, csv_path, seed, device, output_d
         '--split', 'test',
         '--output_path', str(inference_output),
         '--seed', str(seed),
-        '--device', device,
+        '--device', device
     ]
     
     
@@ -443,6 +457,12 @@ Ablation Types:
   3. MoNIG_UniformReliability - Use uniform reliability (r_j = 1/num_experts)
   4. MoNIG_NoContextReliability - Use per-expert learned reliability (no context dependence)
   5. MoNIG_UniformWeightAggregation - Use uniform weight aggregation instead of MoNIG
+  6. MoNIG_ScoresOnlyReliability - Reliability from scores only (r_i = g([s1,s2,s3,s4]), no h(x))
+  7. MoNIG_ConsensusScoring - Consensus-based reliability (heuristic weighting based on expert agreement)
+  8. MoNIG_EnsembleLearning - Ensemble of MoNIG models for improved uncertainty
+  9. MoNIG_SoftmaxReliability - Use softmax(reliability) instead of independent sigmoids
+  10. SimpleAggregation - Simple aggregation baseline (mean of experts)
+  11. Oracle - Oracle upper bound (best expert per sample)
 
 Examples:
   # Run all ablations with default seeds
@@ -479,7 +499,7 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.001,
+    parser.add_argument('--risk_weight', type=float, default=0.0005,
                        help='Risk regularization weight (for NIG/MoNIG)')
     
     # Output

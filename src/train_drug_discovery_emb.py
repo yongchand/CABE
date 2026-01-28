@@ -15,13 +15,15 @@ from torch.utils.data import DataLoader
 
 from src.drug_dataset_emb import DrugDiscoveryDatasetEmb
 from src.drug_models_emb import (
-    DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb, 
+    DrugDiscoveryMoNIGEmb, DrugDiscoveryNIGEmb, DrugDiscoveryGaussianEmb,
     DrugDiscoveryBaselineEmb, DrugDiscoveryDeepEnsemble, DrugDiscoveryMCDropout,
     DrugDiscoveryMoNIG_NoReliabilityScaling, DrugDiscoveryMoNIG_UniformReliability,
     DrugDiscoveryMoNIG_NoContextReliability, DrugDiscoveryMoNIG_UniformWeightAggregation,
-    DrugDiscoverySoftmaxMoE, 
+    DrugDiscoveryMoNIG_ScoresOnlyReliability,
+    DrugDiscoveryConsensusScoring, DrugDiscoveryEnsembleScoring,
+    DrugDiscoverySoftmaxMoE,
     DrugDiscoveryDeepEnsembleMVE,
-    DrugDiscoveryCFGP, DrugDiscoverySWAG
+    DrugDiscoverySVGP, DrugDiscoverySWAG
 )
 from src.utils import moe_nig, criterion_nig as criterion_nig_original
 
@@ -112,7 +114,7 @@ def compute_conformal_quantile(model, loader, device, model_type, expert_indices
                 mu, v, alpha, beta = model(expert_scores, embeddings)
                 epistemic, aleatoric = nig_uncertainty(v, alpha, beta)
                 total_std = torch.sqrt(torch.clamp(epistemic + aleatoric, min=eps))
-            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
+            elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG']:
                 mu, std = model(expert_scores, embeddings)
                 total_std = std
             else:  # Baseline
@@ -215,6 +217,9 @@ def set_seed(seed):
 def train_epoch(model, loader, optimizer, device, model_type, risk_weight, expert_indices=None):
     """
     Train for one epoch
+    
+    Args:
+        optimizer: Single optimizer OR list of optimizers (for ensemble methods)
     """
     model.train()
     total_loss = 0
@@ -231,8 +236,49 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
         embeddings = embeddings.to(device)
         labels = labels.to(device).unsqueeze(1)  # [batch, 1]
         
+        # Handle ensemble methods with separate optimizers
+        if model_type == 'DeepEnsemble' and isinstance(optimizer, list):
+            # Deep Ensemble: train each model INDEPENDENTLY with its own optimizer
+            # This ensures true independence between ensemble members
+            batch_loss = 0
+            for ensemble_model, opt in zip(model.models, optimizer):
+                opt.zero_grad()
+                predictions = ensemble_model(expert_scores, embeddings)
+                loss = torch.nn.functional.mse_loss(predictions, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(ensemble_model.parameters(), 1.0)
+                opt.step()
+                batch_loss += loss.item()
+            total_loss += batch_loss / len(model.models)
+            continue
+            
+        elif model_type == 'DeepEnsembleMVE' and isinstance(optimizer, list):
+            # Deep Ensemble MVE: train each model INDEPENDENTLY with Gaussian NLL
+            # Each member has its own optimizer - true independence for proper UQ
+            batch_loss = 0
+            for ensemble_model, opt in zip(model.models, optimizer):
+                opt.zero_grad()
+                mu, sigma = ensemble_model(expert_scores, embeddings)  # mean, variance
+                loss = criterion_gaussian(mu, sigma, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(ensemble_model.parameters(), 1.0)
+                opt.step()
+                batch_loss += loss.item()
+            total_loss += batch_loss / len(model.models)
+            continue
+
+        # Handle heuristic baselines BEFORE optimizer.zero_grad()
+        if model_type in ['ConsensusScoring', 'EnsembleScoring']:
+            # These are heuristic baselines with NO learnable parameters
+            # Just compute loss for logging, no backprop needed
+            mu, std = model(expert_scores, embeddings)
+            loss = criterion_gaussian(mu, std ** 2, labels)
+            total_loss += loss.item()
+            continue  # Skip backprop since nothing to optimize
+
+        # Standard single-optimizer path for other models
         optimizer.zero_grad()
-        
+
         if model_type == 'MoNIG' or model_type.startswith('MoNIG_'):
             # Get per-expert NIGs
             nigs = model(expert_scores, embeddings)
@@ -251,7 +297,6 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
                 for mu, v, alpha, beta in nigs:
                     loss += criterion_nig(mu, v, alpha, beta, labels, risk_weight)
                 loss += criterion_nig(mu_final, v_final, alpha_final, beta_final, labels, risk_weight)
-                loss = loss / (len(nigs) + 1)  # Average
             
         elif model_type == 'NIG':
             # Single NIG
@@ -264,7 +309,7 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
             loss = criterion_gaussian(mu, sigma, labels)
             
         elif model_type == 'DeepEnsemble':
-            # Deep Ensemble: train each model separately
+            # Fallback for single optimizer (legacy) - NOT RECOMMENDED
             loss = 0
             for ensemble_model in model.models:
                 predictions = ensemble_model(expert_scores, embeddings)
@@ -272,16 +317,15 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
             loss = loss / len(model.models)
             
         elif model_type == 'MCDropout':
-            # MC Dropout: single prediction (dropout handled in forward)
-            # Concatenate inputs for the Sequential model
-            x = torch.cat([expert_scores, embeddings], dim=1)
-            predictions = model.model(x)
-            loss = torch.nn.functional.mse_loss(predictions, labels)
+            # MC Dropout with heteroscedastic output: predict mean and variance
+            # Use train_forward for single pass during training
+            mu, var = model.train_forward(expert_scores, embeddings)
+            loss = criterion_gaussian(mu, var, labels)
         
         elif model_type == 'SWAG':
             # SWAG: train base model normally, collect snapshots later
-            # Use the base model inside SWAG for training
-            mu, sigma = model.base_model(expert_scores, embeddings)
+            # Use train_forward for training (no SWAG sampling)
+            mu, sigma = model.train_forward(expert_scores, embeddings)
             loss = criterion_gaussian(mu, sigma, labels)
             
         elif model_type == 'SoftmaxMoE':
@@ -292,13 +336,14 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
             loss = criterion_gaussian(mu, variance, labels)
             
         elif model_type == 'DeepEnsembleMVE':
-            # Deep Ensemble with MVE
-            mu, std = model(expert_scores, embeddings)
-            # Use Gaussian NLL loss
-            variance = std ** 2
-            loss = criterion_gaussian(mu, variance, labels)
+            # Fallback for single optimizer (legacy) - NOT RECOMMENDED
+            loss = 0
+            for ensemble_model in model.models:
+                mu, sigma = ensemble_model(expert_scores, embeddings)
+                loss += criterion_gaussian(mu, sigma, labels)
+            loss = loss / len(model.models)
             
-        elif model_type == 'CFGP':
+        elif model_type == 'SVGP':
             # Convolutional-Fed Gaussian Process
             mu, std, kl_div = model(expert_scores, embeddings, compute_loss_terms=True)
             # Negative log-likelihood loss
@@ -306,7 +351,7 @@ def train_epoch(model, loader, optimizer, device, model_type, risk_weight, exper
             # KL divergence for variational GP (regularization)
             kl_weight = 0.01  # Weight for KL term
             loss = nll_loss + kl_weight * kl_div / len(loader.dataset)  # Scale KL by dataset size
-            
+
         else:  # Baseline
             predictions = model(expert_scores, embeddings)
             loss = torch.nn.functional.mse_loss(predictions, labels)
@@ -369,7 +414,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
                 mu, std = model(expert_scores, embeddings)
                 all_variance.extend((std ** 2).cpu().numpy().flatten())
                 
-            elif model_type in ['SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
+            elif model_type in ['SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG', 'ConsensusScoring', 'EnsembleScoring']:
                 mu, std = model(expert_scores, embeddings)
                 all_variance.extend((std ** 2).cpu().numpy().flatten())
                 
@@ -404,7 +449,7 @@ def evaluate(model, loader, device, model_type, expert_indices=None):
     if model_type in ['MoNIG', 'NIG'] or model_type.startswith('MoNIG_'):
         metrics['mean_epistemic'] = np.mean(all_epistemic)
         metrics['mean_aleatoric'] = np.mean(all_aleatoric)
-    elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG']:
+    elif model_type in ['Gaussian', 'DeepEnsemble', 'MCDropout', 'SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG']:
         metrics['mean_variance'] = np.mean(all_variance)
         metrics['mean_std'] = np.sqrt(metrics['mean_variance'])
     
@@ -424,9 +469,11 @@ def main():
     # Model
     parser.add_argument('--model_type', type=str, default='MoNIG',
                        choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
-                                'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
+                                'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability',
                                 'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
-                                'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                                'MoNIG_ScoresOnlyReliability',
+                                'ConsensusScoring', 'EnsembleScoring',
+                                'SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG'],
                        help='Model type (including ablation variants and UQ baselines)')
     parser.add_argument('--hidden_dim', type=int, default=256,
                        help='Hidden dimension')
@@ -437,7 +484,7 @@ def main():
     parser.add_argument('--num_mc_samples', type=int, default=50,
                        help='Number of MC samples for MCDropout')
     parser.add_argument('--num_inducing', type=int, default=128,
-                       help='Number of inducing points for CFGP (default: 128)')
+                       help='Number of inducing points for SVGP (default: 128)')
     parser.add_argument('--max_num_models', type=int, default=20,
                        help='Maximum number of models for SWAG (default: 20)')
     parser.add_argument('--swag_start', type=int, default=75,
@@ -504,20 +551,33 @@ def main():
     # Set seed
     set_seed(args.seed)
     
-    # Load test set PDB IDs from test.csv file
-    test_pdb_ids = None
-    test_file = 'data/test.csv'
-    if os.path.isfile(test_file):
-        # Read from CSV file (expecting 'name' column with PDB IDs)
-        test_df = pd.read_csv(test_file)
-        if 'name' in test_df.columns:
-            test_pdb_ids = test_df['name'].astype(str).tolist()
+    # Helper function to load PDB IDs from CSV file
+    def load_pdb_ids(file_path, name=None):
+        """Load PDB IDs from a CSV file (no header, one ID per line or with 'name' column)"""
+        if not os.path.isfile(file_path):
+            return None
+        df = pd.read_csv(file_path, header=None)
+        # Handle both single column (no header) and 'name' column formats
+        if len(df.columns) == 1:
+            pdb_ids = df.iloc[:, 0].astype(str).tolist()
         else:
-            # Fallback: use first column
-            test_pdb_ids = test_df.iloc[:, 0].astype(str).tolist()
-        print(f"Loaded {len(test_pdb_ids)} test PDB IDs from {test_file}")
-    else:
-        raise FileNotFoundError(f"Test file not found at {test_file}. Please provide data/test.csv")
+            # Try to find 'name' column
+            df_with_header = pd.read_csv(file_path)
+            if 'name' in df_with_header.columns:
+                pdb_ids = df_with_header['name'].astype(str).tolist()
+            else:
+                pdb_ids = df_with_header.iloc[:, 0].astype(str).tolist()
+        if name:
+            print(f"Loaded {len(pdb_ids)} {name} PDB IDs from {file_path}")
+        return pdb_ids
+    
+    # Load PDB IDs for explicit splits
+    train_pdb_ids = load_pdb_ids('data/train_pdbs.csv', 'train')
+    valid_pdb_ids = load_pdb_ids('data/validation_pdbs.csv', 'validation')
+    test_pdb_ids = load_pdb_ids('data/test_pdbs.csv', 'test')
+    
+    if train_pdb_ids is None or valid_pdb_ids is None or test_pdb_ids is None:
+        raise FileNotFoundError("Missing split files. Need: data/train_pdbs.csv, data/validation_pdbs.csv, data/test_pdbs.csv")
     
     print("="*50)
     print("Drug Discovery with MoNIG (Embeddings)")
@@ -526,23 +586,26 @@ def main():
     print(f"Expert Config: {expert_config}")
     print(f"Device: {args.device}")
     print(f"CSV: {args.csv_path}")
-    print(f"Test set: {len(test_pdb_ids)} complexes")
+    print(f"Train PDBs: {len(train_pdb_ids)}")
+    print(f"Valid PDBs: {len(valid_pdb_ids)}")
+    print(f"Test PDBs: {len(test_pdb_ids)}")
     print("="*50)
     
     # Load datasets
     print("\nLoading datasets...")
     train_dataset = DrugDiscoveryDatasetEmb(
-        args.csv_path, split='train', seed=args.seed, test_pdb_ids=test_pdb_ids)
+        args.csv_path, split='train', seed=args.seed,
+        train_pdb_ids=train_pdb_ids, valid_pdb_ids=valid_pdb_ids, test_pdb_ids=test_pdb_ids)
     norm_stats = {
         'mean': train_dataset.emb_mean,
         'std': train_dataset.emb_std
     }
     valid_dataset = DrugDiscoveryDatasetEmb(
         args.csv_path, split='valid', seed=args.seed, normalization_stats=norm_stats,
-        test_pdb_ids=test_pdb_ids)
+        train_pdb_ids=train_pdb_ids, valid_pdb_ids=valid_pdb_ids, test_pdb_ids=test_pdb_ids)
     test_dataset = DrugDiscoveryDatasetEmb(
         args.csv_path, split='test', seed=args.seed, normalization_stats=norm_stats,
-        test_pdb_ids=test_pdb_ids)
+        train_pdb_ids=train_pdb_ids, valid_pdb_ids=valid_pdb_ids, test_pdb_ids=test_pdb_ids)
     
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     valid_loader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False)
@@ -598,6 +661,14 @@ def main():
         model = DrugDiscoveryMoNIG_NoContextReliability(hyp_params)
     elif args.model_type == 'MoNIG_UniformWeightAggregation':
         model = DrugDiscoveryMoNIG_UniformWeightAggregation(hyp_params)
+    elif args.model_type == 'MoNIG_ScoresOnlyReliability':
+        model = DrugDiscoveryMoNIG_ScoresOnlyReliability(hyp_params)
+    elif args.model_type == 'ConsensusScoring':
+        # ConsensusScoring is a heuristic with no learnable parameters
+        model = DrugDiscoveryConsensusScoring(hyp_params)
+    elif args.model_type == 'EnsembleScoring':
+        # EnsembleScoring is a heuristic with no learnable parameters
+        model = DrugDiscoveryEnsembleScoring(hyp_params)
     elif args.model_type == 'NIG':
         model = DrugDiscoveryNIGEmb(hyp_params)
     elif args.model_type == 'Gaussian':
@@ -613,35 +684,56 @@ def main():
     elif args.model_type == 'DeepEnsembleMVE':
         hyp_params.num_models = args.num_models
         model = DrugDiscoveryDeepEnsembleMVE(hyp_params)
-    elif args.model_type == 'CFGP':
+    elif args.model_type == 'SVGP':
         hyp_params.num_inducing = args.num_inducing if hasattr(args, 'num_inducing') else 128
-        model = DrugDiscoveryCFGP(hyp_params)
+        model = DrugDiscoverySVGP(hyp_params)
     elif args.model_type == 'SWAG':
         hyp_params.max_num_models = args.max_num_models if hasattr(args, 'max_num_models') else 20
         hyp_params.no_cov_mat = True  # Use diagonal covariance for efficiency
         hyp_params.num_swag_samples = args.num_swag_samples if hasattr(args, 'num_swag_samples') else 30
         model = DrugDiscoverySWAG(hyp_params)
-        # Base model is stored inside SWAG wrapper
-        base_model = model.base_model
     else:
         model = DrugDiscoveryBaselineEmb(hyp_params)
     
     model = model.to(args.device)
     print(f"\nModel created: {sum(p.numel() for p in model.parameters())} parameters")
-    
+
     # Optimizer and scheduler (for neural network models)
-    if args.model_type == 'SWAG':
-        # For SWAG, optimize the base_model (separate from SWAG wrapper's internal base)
-        base_model = model.base_model
+    if args.model_type in ['ConsensusScoring', 'EnsembleScoring']:
+        # Heuristic baselines with NO learnable parameters - no optimizer needed
+        optimizer = None
+        scheduler = None
+        swag_optimizer = None
+        base_model = None
+        print("  No optimizer needed (heuristic baseline)")
+    elif args.model_type == 'SWAG':
+        # For SWAG, optimize the base model inside the SWAG wrapper
+        base_model = model.get_base_model()
         optimizer = optim.Adam(base_model.parameters(), lr=args.lr, weight_decay=1e-5)
         # SWAG collection uses a separate optimizer with different LR
-        swag_optimizer = optim.Adam(base_model.parameters(), lr=args.swag_lr, weight_decay=1e-5) if hasattr(args, 'swag_lr') else None
+        swag_lr = args.swag_lr if hasattr(args, 'swag_lr') else args.lr
+        swag_optimizer = optim.Adam(base_model.parameters(), lr=swag_lr, weight_decay=1e-5)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
+    elif args.model_type in ['DeepEnsemble', 'DeepEnsembleMVE']:
+        # Create SEPARATE optimizers for each ensemble member to ensure independence
+        # This is critical for proper ensemble diversity and uncertainty estimation
+        optimizer = [
+            optim.Adam(ensemble_model.parameters(), lr=args.lr, weight_decay=1e-5)
+            for ensemble_model in model.models
+        ]
+        # Create separate schedulers for each optimizer
+        scheduler = [
+            ReduceLROnPlateau(opt, mode='min', patience=15, factor=0.5)
+            for opt in optimizer
+        ]
+        swag_optimizer = None
+        base_model = None
+        print(f"  Created {len(optimizer)} independent optimizers for ensemble members")
     else:
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
         swag_optimizer = None
         base_model = None
-    
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
+        scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
     
     # Training loop
     print("\nStarting training...")
@@ -662,12 +754,27 @@ def main():
         # Evaluate
         val_metrics = evaluate(model, valid_loader, args.device, args.model_type, expert_indices)
         
-        # Scheduler step
-        old_lr = optimizer.param_groups[0]['lr']
-        scheduler.step(val_metrics['mae'])
-        new_lr = optimizer.param_groups[0]['lr']
-        if new_lr < old_lr:
-            print(f"  → Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
+        # Scheduler step - handle list of schedulers for ensemble methods
+        if scheduler is None:
+            # Heuristic baselines (ConsensusScoring, EnsembleScoring) - no scheduler
+            pass
+        elif isinstance(scheduler, list):
+            # Ensemble methods: step all schedulers
+            lr_reduced = False
+            for i, (sched, opt) in enumerate(zip(scheduler, optimizer)):
+                old_lr = opt.param_groups[0]['lr']
+                sched.step(val_metrics['mae'])
+                new_lr = opt.param_groups[0]['lr']
+                if new_lr < old_lr and not lr_reduced:
+                    print(f"  → Learning rate reduced for all ensemble members: {old_lr:.6f} -> {new_lr:.6f}")
+                    lr_reduced = True
+        else:
+            # Single scheduler
+            old_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(val_metrics['mae'])
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr < old_lr:
+                print(f"  → Learning rate reduced: {old_lr:.6f} -> {new_lr:.6f}")
         
         # SWAG collection (after swag_start epoch)
         if args.model_type == 'SWAG' and epoch >= args.swag_start and epoch % args.swag_freq == 0:
@@ -683,16 +790,16 @@ def main():
                     expert_scores = expert_scores.to(args.device)
                     embeddings = embeddings.to(args.device)
                     labels = labels.to(args.device).unsqueeze(1)
-                    
+
                     swag_optimizer.zero_grad()
-                    mu, sigma = base_model(expert_scores, embeddings)
+                    mu, sigma = model.train_forward(expert_scores, embeddings)
                     loss = criterion_gaussian(mu, sigma, labels)
                     loss.backward()
                     swag_optimizer.step()
                     break  # Just one batch for SWAG collection
-            
-            # Collect model snapshot
-            model.collect_model(base_model)
+
+            # Collect model snapshot (uses internal base model)
+            model.collect_model()
             print(f"  → Collected SWAG model snapshot (n={model.swag.n_models.item()})")
         
         # Print progress

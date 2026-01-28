@@ -46,9 +46,11 @@ Examples:
     # Model
     train_parser.add_argument('--model_type', type=str, default='MoNIG',
                              choices=['MoNIG', 'NIG', 'Gaussian', 'Baseline', 'DeepEnsemble', 'MCDropout',
-                                      'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability', 
+                                      'MoNIG_NoReliabilityScaling', 'MoNIG_UniformReliability',
                                       'MoNIG_NoContextReliability', 'MoNIG_UniformWeightAggregation',
-                                      'SoftmaxMoE', 'DeepEnsembleMVE', 'CFGP', 'SWAG'],
+                                      'MoNIG_ScoresOnlyReliability',
+                                      'ConsensusScoring', 'EnsembleScoring',
+                                      'SoftmaxMoE', 'DeepEnsembleMVE', 'SVGP', 'SWAG'],
                              help='Model type (including ablation variants and UQ baselines)')
     train_parser.add_argument('--hidden_dim', type=int, default=256,
                              help='Hidden dimension')
@@ -59,7 +61,7 @@ Examples:
     train_parser.add_argument('--num_mc_samples', type=int, default=50,
                              help='Number of MC samples for MCDropout')
     train_parser.add_argument('--num_inducing', type=int, default=128,
-                             help='Number of inducing points for CFGP (default: 128)')
+                             help='Number of inducing points for SVGP (default: 128)')
     train_parser.add_argument('--max_num_models', type=int, default=20,
                              help='Maximum number of models for SWAG (default: 20)')
     train_parser.add_argument('--swag_start', type=int, default=75,
@@ -137,7 +139,7 @@ Examples:
     infer_parser.add_argument('--num_mc_samples', type=int, default=50,
                              help='Number of MC samples for MCDropout')
     infer_parser.add_argument('--num_inducing', type=int, default=128,
-                             help='Number of inducing points for CFGP (default: 128)')
+                             help='Number of inducing points for SVGP (default: 128)')
     infer_parser.add_argument('--num_swag_samples', type=int, default=30,
                              help='Number of SWAG samples for inference (default: 30)')
     

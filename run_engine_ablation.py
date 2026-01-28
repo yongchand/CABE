@@ -523,7 +523,7 @@ Examples:
                        help='Dropout rate')
     parser.add_argument('--lr', type=float, default=5e-4,
                        help='Learning rate')
-    parser.add_argument('--risk_weight', type=float, default=0.001,
+    parser.add_argument('--risk_weight', type=float, default=0.005,
                        help='Risk regularization weight (for MoNIG)')
     
     # Output
